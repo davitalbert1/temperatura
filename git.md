@@ -27,7 +27,7 @@ git remote -v
 ### Definir branch principal
 
 ```bash
-git branch -M main
+git branch -main
 ```
 
 ---

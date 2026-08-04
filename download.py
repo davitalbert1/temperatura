@@ -1,62 +1,59 @@
-#!/usr/bin/env python3
-"""
-download.py - Download de informações climáticas via API gratuita (Open-Meteo)
-
-API utilizada: Open-Meteo (https://open-meteo.com)
-  - Não requer autenticação, chaves ou tokens
-  - Fornece: temperatura, sensação térmica, umidade, precipitação,
-    nascer/pôr do sol, nascer/pôr da lua, índice UV, polen, qualidade do ar
-
-Dados são armazenados em um arquivo SQLite (.db).
-Antes de baixar, verifica se os dados já existem no banco para evitar duplicatas.
-
-Uso:
-    python download.py
-"""
-
+import os
+import random
 import sqlite3
-import requests
-from datetime import datetime, timedelta
+import threading
 import time
-import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ============================================================================
-# CONFIGURAÇÕES
-# ============================================================================
-
-# Caminho do arquivo de banco de dados SQLite
 DB_PATH = "clima.db"
+MAX_WORKERS = int(os.environ.get("OPENMETEO_WORKERS", "2"))
+CHUNK_DIAS = int(os.environ.get("OPENMETEO_CHUNK_DIAS", "30"))
+REQUESTS_PER_SECOND = float(os.environ.get("OPENMETEO_RPS", "1.5"))
+MAX_RETRIES = int(os.environ.get("OPENMETEO_RETRIES", "8"))
+RETRY_SEQUENCIAL_TENTATIVAS = int(os.environ.get("OPENMETEO_RETRY_SEQ", "8"))
+RETRY_SEQUENCIAL_INTERVALO = float(os.environ.get("OPENMETEO_RETRY_SEQ_INTERVALO", "2.0"))
+HTTP_TIMEOUT = float(os.environ.get("OPENMETEO_TIMEOUT", "120"))
+JITTER_INICIAL_MAX = float(os.environ.get("OPENMETEO_JITTER", "5.0"))
+BACKOFF_INICIAL = float(os.environ.get("OPENMETEO_BACKOFF", "2.0"))
+BACKOFF_MAXIMO = float(os.environ.get("OPENMETEO_BACKOFF_MAX", "60.0"))
 
-# Coordenadas geográficas (latitude, longitude)
-# Exemplo: São Paulo, Brasil
-LATITUDE = -23.5505
-LONGITUDE = -46.6333
-
-# Fuso horário (IANA timezone)
+# Coordenadas geográficas como array de arrays [latitude, longitude].
+# Cada localização é processada em paralelo. Exemplo: São Paulo, Brasil
+COORDENADAS = [
+    [-23.5505, -46.6333], # São Paulo, Brasil
+    [-26.3044, -48.8456], # Joinville, Brasil
+    [-25.4278, -49.2731], # Curitiba, Brasil
+    [-28.7833, -51.6100], # Nova Prata, Brasil
+    [-20.4697, -54.6201], # Campo Grande, Brasil
+    [-3.1019, -60.0250], # Manaus, Brasil
+    [-3.7250, -38.5236], # Fortaleza, Brasil
+    [52.5200, 13.4050], # Berlim, Alemanha
+    [35.6762, 139.6503], # Tóquio, Japão
+    [40.7128, -74.0060], # Nova York, EUA
+    [55.7558, 37.6173], # Moscou, Rússia
+    [43.1155, 131.8855], # Vladivostok, Rússia
+    [-33.4489, -70.6693], # Santiago, Chile
+    [-54.8019, -68.3030], # Ushuaia, Argentina
+    [-33.9249, 18.4241], # Cidade do Cabo, África do Sul
+    [19.4326, -99.1332], # Cidade do México, México
+    [61.2181, -149.9003], # Anchorage, EUA (Alasca)
+]
 FUSO_HORARIO = "America/Sao_Paulo"
 
-# ----------------------------------------------------------------------------
-# ARRAY COM O PERÍODO DE DOWNLOAD
-# Informe as datas (formato YYYY-MM-DD) que deseja baixar.
-# O script fará o download dia por dia, verificando se já existe no .db.
-# Exemplo: ["2024-01-01", "2024-01-02", "2024-01-03"]
-# ----------------------------------------------------------------------------
 PERIODO_DOWNLOAD = [
-    "2024-01-01",
-    "2024-01-02",
-    "2024-01-03",
-    "2024-01-04",
+    "2000-01-01",
     "2024-01-05",
 ]
 
-# Endpoints da API Open-Meteo (gratuita, sem autenticação)
 URL_FORECAST = "https://api.open-meteo.com/v1/forecast"
-URL_AIR_QUALITY = "https://api.open-meteo.com/v1/air-quality"
+URL_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
+URL_AIR_QUALITY = "https://air-quality-api.open-meteo.com/v1/air-quality"
 URL_POLLEN = "https://api.open-meteo.com/v1/pollen"
 
-# Parâmetros que queremos baixar da API de previsão (forecast)
-# - daily: dados diários (nascer/pôr do sol, lua, UV máximo, etc.)
-# - hourly: dados por hora (temperatura, sensação térmica, umidade, chuva, UV)
 DAILY_PARAMS = [
     "weathercode",
     "temperature_2m_max",
@@ -112,23 +109,27 @@ HOURLY_PARAMS = [
     "weathercode",
 ]
 
-# Parâmetros de qualidade do ar (air quality)
+# Parâmetros diários NÃO suportados pela API de arquivo (histórico)
+DAILY_PARAMS_NAO_SUPORTADOS_NO_ARQUIVO = {
+    "relativehumidity_2m_max",
+    "relativehumidity_2m_min",
+    "moonrise",
+    "moonset",
+}
+
 AIR_QUALITY_HOURLY = [
     "pm10",
     "pm2_5",
     "carbon_monoxide",
     "nitrogen_dioxide",
-    "sulfur_dioxide",
+    "sulphur_dioxide",
     "ozone",
-    "aerosol",
     "dust",
-    "ammonium",
-    "radon",
     "formaldehyde",
-    "mercury",
 ]
 
-# Parâmetros de polen (pollen API)
+DATA_MINIMA_QUALIDADE_AR = "2013-01-01"
+
 POLLEN_DAILY = [
     "alder_pollen_mean",
     "birch_pollen_mean",
@@ -137,27 +138,80 @@ POLLEN_DAILY = [
     "grass_pollen_mean",
 ]
 
+# Infraestrutura de concorrência
+local = threading.local()
+write_lock = threading.Lock()
+print_lock = threading.Lock()
 
-# ============================================================================
-# FUNÇÕES DE BANCO DE DADOS
-# ============================================================================
+# Rate-limit GLOBAL: controla o ritmo de requisições em todas as threads somadas.
+# A API gratuita do Open-Meteo é rigorosa; exceder o limite causa HTTP 429.
+_min_intervalo = 1.0 / REQUESTS_PER_SECOND
+_rate_lock = threading.Lock()
+_ultima_requisicao = 0.0
+
+def _esperar_rate_limit():
+    """Garante que o intervalo mínimo entre requisições (global) seja respeitado."""
+    global _ultima_requisicao
+    with _rate_lock:
+        agora = time.time()
+        espera = _min_intervalo - (agora - _ultima_requisicao)
+        if espera > 0:
+            time.sleep(espera)
+        # Atualiza considerando o instante em que começou a esperar
+        _ultima_requisicao = time.time()
 
 def get_connection():
-    """Retorna uma conexão com o banco SQLite."""
-    return sqlite3.connect(DB_PATH)
+    if not hasattr(local, "conn"):
+        conn = sqlite3.connect(DB_PATH, timeout=60)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=60000")
+        local.conn = conn
+    return local.conn
 
+def get_session():
+    if not hasattr(local, "session"):
+        session = requests.Session()
+        # Retry automático apenas para falhas de conexão/transporte (não para 429,
+        # que tratamos manualmente em baixar_com_retry com backoff + Retry-After).
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            status=0,
+            backoff_factor=0.5,
+            status_forcelist=[],
+            respect_retry_after_header=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=MAX_WORKERS + 2, pool_maxsize=MAX_WORKERS + 2)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        local.session = session
+    return local.session
 
+def log(msg):
+    with print_lock: print(msg, flush=True)
+
+# Banco de dados
 def init_database():
-    """Cria as tabelas do banco de dados se não existirem."""
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Tabela de dados diários (resumo climático do dia)
+    # Migração: se o esquema antigo for detectado.
+    cursor.execute("PRAGMA table_info(clima_horario)")
+    colunas_horario = [col[1] for col in cursor.fetchall()]
+    if colunas_horario and "latitude" not in colunas_horario:
+        log("[DB] Esquema antigo detectado. Recriando tabelas para suportar múltiplas localizações...")
+        cursor.execute("DROP TABLE IF EXISTS clima_diario")
+        cursor.execute("DROP TABLE IF EXISTS clima_horario")
+        cursor.execute("DROP TABLE IF EXISTS qualidade_ar")
+        cursor.execute("DROP TABLE IF EXISTS polen")
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS clima_diario (
-            data TEXT PRIMARY KEY,
-            latitude REAL,
-            longitude REAL,
+            data TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
             timezone TEXT,
             weathercode INTEGER,
             temperatura_max REAL,
@@ -184,16 +238,18 @@ def init_database():
             pressao_min REAL,
             pressao_superficie_max REAL,
             pressao_superficie_min REAL,
-            created_at TEXT
+            created_at TEXT,
+            PRIMARY KEY (data, latitude, longitude)
         )
     """)
 
-    # Tabela de dados horários (detalhes por hora)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS clima_horario (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data TEXT,
-            hora TEXT,
+            data TEXT NOT NULL,
+            hora TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
             temperatura REAL,
             sensacao_termica REAL,
             umidade REAL,
@@ -218,16 +274,18 @@ def init_database():
             visibilidade REAL,
             is_day INTEGER,
             weathercode INTEGER,
-            created_at TEXT
+            created_at TEXT,
+            UNIQUE (data, hora, latitude, longitude)
         )
     """)
 
-    # Tabela de qualidade do ar
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS qualidade_ar (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data TEXT,
-            hora TEXT,
+            data TEXT NOT NULL,
+            hora TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
             pm10 REAL,
             pm2_5 REAL,
             monoxido_carbono REAL,
@@ -240,306 +298,320 @@ def init_database():
             radon REAL,
             formaldeido REAL,
             mercurio REAL,
-            created_at TEXT
+            created_at TEXT,
+            UNIQUE (data, hora, latitude, longitude)
         )
     """)
 
-    # Tabela de polen
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS polen (
-            data TEXT PRIMARY KEY,
-            latitude REAL,
-            longitude REAL,
+            data TEXT NOT NULL,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
             alder_pollen_mean REAL,
             birch_pollen_mean REAL,
             olive_pollen_mean REAL,
             ragweed_pollen_mean REAL,
             grass_pollen_mean REAL,
-            created_at TEXT
+            created_at TEXT,
+            PRIMARY KEY (data, latitude, longitude)
         )
     """)
 
     conn.commit()
-    conn.close()
-    print("[DB] Banco de dados inicializado com sucesso.")
+    log("[DB] Banco de dados inicializado com sucesso.")
 
-
-def data_diaria_existe(data):
-    """Verifica se os dados diários de uma data já existem no banco."""
+def carregar_existentes():
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM clima_diario WHERE data = ?", (data,))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
 
-
-def data_horaria_existe(data):
-    """Verifica se os dados horários de uma data já existem no banco."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM clima_horario WHERE data = ? LIMIT 1", (data,))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
-
-
-def qualidade_ar_existe(data):
-    """Verifica se os dados de qualidade do ar de uma data já existem no banco."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM qualidade_ar WHERE data = ? LIMIT 1", (data,))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
-
-
-def polen_existe(data):
-    """Verifica se os dados de polen de uma data já existem no banco."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM polen WHERE data = ?", (data,))
-    result = cursor.fetchone()
-    conn.close()
-    return result is not None
-
-
-# ============================================================================
-# FUNÇÕES DE DOWNLOAD DA API
-# ============================================================================
-
-def baixar_dados_diarios(data):
-    """
-    Baixa dados diários da API Open-Meteo para uma data específica.
-    Retorna um dicionário com os dados ou None em caso de erro.
-    """
-    params = {
-        "latitude": LATITUDE,
-        "longitude": LONGITUDE,
-        "start_date": data,
-        "end_date": data,
-        "daily": ",".join(DAILY_PARAMS),
-        "timezone": FUSO_HORARIO,
+    existentes = {
+        "diario": set(),
+        "horario": set(),
+        "qualidade_ar": set(),
+        "polen": set(),
     }
 
+    cursor.execute("SELECT data, latitude, longitude FROM clima_diario")
+    for data, lat, lon in cursor.fetchall(): existentes["diario"].add((data, float(lat), float(lon)))
+
+    cursor.execute("SELECT DISTINCT data, latitude, longitude FROM clima_horario")
+    for data, lat, lon in cursor.fetchall(): existentes["horario"].add((data, float(lat), float(lon)))
+
+    cursor.execute("SELECT DISTINCT data, latitude, longitude FROM qualidade_ar")
+    for data, lat, lon in cursor.fetchall(): existentes["qualidade_ar"].add((data, float(lat), float(lon)))
+
+    cursor.execute("SELECT data, latitude, longitude FROM polen")
+    for data, lat, lon in cursor.fetchall(): existentes["polen"].add((data, float(lat), float(lon)))
+
+    conn.close()
+    return existentes
+
+# Helpers de download
+def get_url_clima(data):
     try:
-        response = requests.get(URL_FORECAST, params=params, timeout=30)
-        response.raise_for_status()
-        dados = response.json()
+        data_dt = datetime.strptime(data, "%Y-%m-%d").date()
+        hoje = datetime.now().date()
+        if data_dt < hoje: return URL_ARCHIVE
+        return URL_FORECAST
+    except ValueError:
+        return URL_FORECAST
 
-        if "daily" not in dados or not dados["daily"]:
-            print(f"  [AVISO] Nenhum dado diário retornado para {data}")
-            return None
+def _get_valor(dados, chave, indice):
+    lista = dados.get(chave)
+    if not lista or indice >= len(lista): return None
+    return lista[indice]
 
-        daily = dados["daily"]
-        # Como start_date == end_date, há apenas um elemento em cada lista
-        idx = 0
+def baixar_com_retry(url, params, session, max_tentativas=MAX_RETRIES):
+    for tentativa in range(1, max_tentativas + 1):
+        # Respeita o rate-limit global ANTES de cada tentativa (evita 429 precoce)
+        _esperar_rate_limit()
 
-        return {
+        try:
+            response = session.get(url, params=params, timeout=HTTP_TIMEOUT)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as e:
+            # 429 = Too Many Requests: a API pede para esperar. Usar Retry-After se houver.
+            status = getattr(e.response, "status_code", None)
+            if status == 429:
+                retry_after = None
+                try:
+                    retry_after = float(e.response.headers.get("Retry-After", ""))
+                except (TypeError, ValueError):
+                    retry_after = None
+                if retry_after is None:
+                    retry_after = min(BACKOFF_MAXIMO, (BACKOFF_INICIAL * (2 ** (tentativa - 1))) * random.uniform(0.5, 1.5))
+                espera = retry_after
+                if tentativa == max_tentativas:
+                    log(f"  [ERRO] 429 persistente após {max_tentativas} tentativas em {url}")
+                    return None
+                log(f"  [RETRY {tentativa}/{max_tentativas}] HTTP 429 (rate-limit). Aguardando {espera:.1f}s...")
+                time.sleep(espera)
+            else:
+                if tentativa == max_tentativas:
+                    log(f"  [ERRO] Falha após {max_tentativas} tentativas em {url}: {e}")
+                    return None
+                espera = min(BACKOFF_MAXIMO, (BACKOFF_INICIAL * (2 ** (tentativa - 1))) * random.uniform(0.5, 1.5))
+                log(f"  [RETRY {tentativa}/{max_tentativas}] HTTP {status}: {e}. Aguardando {espera:.1f}s...")
+                time.sleep(espera)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            # Timeout/erro de conexão: espera curta e tenta de novo.
+            if tentativa == max_tentativas:
+                log(f"  [ERRO] Falha após {max_tentativas} tentativas em {url}: {e}")
+                return None
+            espera = min(BACKOFF_MAXIMO, (BACKOFF_INICIAL * (2 ** tentativa)) * random.uniform(0.5, 1.5))
+            log(f"  [RETRY {tentativa}/{max_tentativas}] {type(e).__name__}. Aguardando {espera:.1f}s...")
+            time.sleep(espera)
+    return None
+
+def agrupar_por_url(datas, chunk=CHUNK_DIAS):
+    grupos = []
+    for url in (URL_ARCHIVE, URL_FORECAST):
+        lista = sorted(d for d in datas if get_url_clima(d) == url)
+        for i in range(0, len(lista), chunk): grupos.append((url, lista[i:i + chunk]))
+    return grupos
+
+# Parsing das respostas (converte JSON em listas de dicionários)
+def parse_diario(daily, lat, lon, timezone, datas_filtro=None):
+    filtro = set(datas_filtro) if datas_filtro else None
+    times = daily.get("time", [])
+    registros = []
+    for i, data in enumerate(times):
+        if filtro and data not in filtro: continue
+        registros.append({
             "data": data,
-            "latitude": dados.get("latitude"),
-            "longitude": dados.get("longitude"),
-            "timezone": dados.get("timezone"),
-            "weathercode": daily.get("weathercode", [None])[idx],
-            "temperatura_max": daily.get("temperature_2m_max", [None])[idx],
-            "temperatura_min": daily.get("temperature_2m_min", [None])[idx],
-            "sensacao_termica_max": daily.get("apparent_temperature_max", [None])[idx],
-            "sensacao_termica_min": daily.get("apparent_temperature_min", [None])[idx],
-            "umidade_max": daily.get("relativehumidity_2m_max", [None])[idx],
-            "umidade_min": daily.get("relativehumidity_2m_min", [None])[idx],
-            "precipitacao_total": daily.get("precipitation_sum", [None])[idx],
-            "probabilidade_chuva": daily.get("precipitation_probability_max", [None])[idx],
-            "chuva_total": daily.get("rain_sum", [None])[idx],
-            "aguas_claras_total": daily.get("showers_sum", [None])[idx],
-            "neve_total": daily.get("snowfall_sum", [None])[idx],
-            "nascer_sol": daily.get("sunrise", [None])[idx],
-            "por_sol": daily.get("sunset", [None])[idx],
-            "nascer_lua": daily.get("moonrise", [None])[idx],
-            "por_lua": daily.get("moonset", [None])[idx],
-            "uv_max": daily.get("uv_index_max", [None])[idx],
-            "uv_clear_sky_max": daily.get("uv_index_clear_sky_max", [None])[idx],
-            "vento_max": daily.get("windspeed_10m_max", [None])[idx],
-            "direcao_vento": daily.get("winddirection_10m_dominant", [None])[idx],
-            "rajadas_vento": daily.get("windgusts_10m_max", [None])[idx],
-            "pressao_max": daily.get("pressure_msl_max", [None])[idx],
-            "pressao_min": daily.get("pressure_msl_min", [None])[idx],
-            "pressao_superficie_max": daily.get("surface_pressure_max", [None])[idx],
-            "pressao_superficie_min": daily.get("surface_pressure_min", [None])[idx],
+            "latitude": lat,
+            "longitude": lon,
+            "timezone": timezone,
+            "weathercode": _get_valor(daily, "weathercode", i),
+            "temperatura_max": _get_valor(daily, "temperature_2m_max", i),
+            "temperatura_min": _get_valor(daily, "temperature_2m_min", i),
+            "sensacao_termica_max": _get_valor(daily, "apparent_temperature_max", i),
+            "sensacao_termica_min": _get_valor(daily, "apparent_temperature_min", i),
+            "umidade_max": _get_valor(daily, "relativehumidity_2m_max", i),
+            "umidade_min": _get_valor(daily, "relativehumidity_2m_min", i),
+            "precipitacao_total": _get_valor(daily, "precipitation_sum", i),
+            "probabilidade_chuva": _get_valor(daily, "precipitation_probability_max", i),
+            "chuva_total": _get_valor(daily, "rain_sum", i),
+            "aguas_claras_total": _get_valor(daily, "showers_sum", i),
+            "neve_total": _get_valor(daily, "snowfall_sum", i),
+            "nascer_sol": _get_valor(daily, "sunrise", i),
+            "por_sol": _get_valor(daily, "sunset", i),
+            "nascer_lua": _get_valor(daily, "moonrise", i),
+            "por_lua": _get_valor(daily, "moonset", i),
+            "uv_max": _get_valor(daily, "uv_index_max", i),
+            "uv_clear_sky_max": _get_valor(daily, "uv_index_clear_sky_max", i),
+            "vento_max": _get_valor(daily, "windspeed_10m_max", i),
+            "direcao_vento": _get_valor(daily, "winddirection_10m_dominant", i),
+            "rajadas_vento": _get_valor(daily, "windgusts_10m_max", i),
+            "pressao_max": _get_valor(daily, "pressure_msl_max", i),
+            "pressao_min": _get_valor(daily, "pressure_msl_min", i),
+            "pressao_superficie_max": _get_valor(daily, "surface_pressure_max", i),
+            "pressao_superficie_min": _get_valor(daily, "surface_pressure_min", i),
+        })
+    return registros
+
+def parse_horario(hourly, lat, lon, datas_filtro=None):
+    filtro = set(datas_filtro) if datas_filtro else None
+    times = hourly.get("time", [])
+    registros = []
+    for i, hora_str in enumerate(times):
+        data = hora_str[:10]
+        if filtro and data not in filtro: continue
+        registros.append({
+            "data": data,
+            "hora": hora_str,
+            "latitude": lat,
+            "longitude": lon,
+            "temperatura": _get_valor(hourly, "temperature_2m", i),
+            "sensacao_termica": _get_valor(hourly, "apparent_temperature", i),
+            "umidade": _get_valor(hourly, "relativehumidity_2m", i),
+            "ponto_orvalho": _get_valor(hourly, "dewpoint_2m", i),
+            "precipitacao": _get_valor(hourly, "precipitation", i),
+            "probabilidade_chuva": _get_valor(hourly, "precipitation_probability", i),
+            "chuva": _get_valor(hourly, "rain", i),
+            "aguas_claras": _get_valor(hourly, "showers", i),
+            "neve": _get_valor(hourly, "snowfall", i),
+            "profundidade_neve": _get_valor(hourly, "snow_depth", i),
+            "uv_index": _get_valor(hourly, "uv_index", i),
+            "uv_index_clear_sky": _get_valor(hourly, "uv_index_clear_sky", i),
+            "vento": _get_valor(hourly, "windspeed_10m", i),
+            "direcao_vento": _get_valor(hourly, "winddirection_10m", i),
+            "rajadas_vento": _get_valor(hourly, "windgusts_10m", i),
+            "pressao": _get_valor(hourly, "pressure_msl", i),
+            "pressao_superficie": _get_valor(hourly, "surface_pressure", i),
+            "cobertura_nuvens": _get_valor(hourly, "cloudcover", i),
+            "cobertura_nuvens_baixa": _get_valor(hourly, "cloudcover_low", i),
+            "cobertura_nuvens_media": _get_valor(hourly, "cloudcover_mid", i),
+            "cobertura_nuvens_alta": _get_valor(hourly, "cloudcover_high", i),
+            "visibilidade": _get_valor(hourly, "visibility", i),
+            "is_day": _get_valor(hourly, "is_day", i),
+            "weathercode": _get_valor(hourly, "weathercode", i),
+        })
+    return registros
+
+def parse_qualidade_ar(hourly, lat, lon, datas_filtro=None):
+    filtro = set(datas_filtro) if datas_filtro else None
+    times = hourly.get("time", [])
+    registros = []
+    for i, hora_str in enumerate(times):
+        data = hora_str[:10]
+        if filtro and data not in filtro: continue
+        registros.append({
+            "data": data,
+            "hora": hora_str,
+            "latitude": lat,
+            "longitude": lon,
+            "pm10": _get_valor(hourly, "pm10", i),
+            "pm2_5": _get_valor(hourly, "pm2_5", i),
+            "monoxido_carbono": _get_valor(hourly, "carbon_monoxide", i),
+            "nitrogenio_dioxide": _get_valor(hourly, "nitrogen_dioxide", i),
+            "enxofre_dioxide": _get_valor(hourly, "sulphur_dioxide", i),
+            "ozonio": _get_valor(hourly, "ozone", i),
+            "aerosois": _get_valor(hourly, "aerosol", i),
+            "poeira": _get_valor(hourly, "dust", i),
+            "amonio": _get_valor(hourly, "ammonium", i),
+            "radon": _get_valor(hourly, "radon", i),
+            "formaldeido": _get_valor(hourly, "formaldehyde", i),
+            "mercurio": _get_valor(hourly, "mercury", i),
+        })
+    return registros
+
+def parse_polen(daily, lat, lon, datas_filtro=None):
+    filtro = set(datas_filtro) if datas_filtro else None
+    times = daily.get("time", [])
+    registros = []
+    for i, data in enumerate(times):
+        if filtro and data not in filtro: continue
+        registros.append({
+            "data": data,
+            "latitude": lat,
+            "longitude": lon,
+            "alder_pollen_mean": _get_valor(daily, "alder_pollen_mean", i),
+            "birch_pollen_mean": _get_valor(daily, "birch_pollen_mean", i),
+            "olive_pollen_mean": _get_valor(daily, "olive_pollen_mean", i),
+            "ragweed_pollen_mean": _get_valor(daily, "ragweed_pollen_mean", i),
+            "grass_pollen_mean": _get_valor(daily, "grass_pollen_mean", i),
+        })
+    return registros
+
+# Downloads em bloco (uma requisição cobre vários dias)
+def baixar_clima_bloco(datas, lat, lon, session):
+    if not datas: return {"diario": [], "horario": []}
+
+    diario, horario = [], []
+    for url, grupo in agrupar_por_url(datas):
+        inicio, fim = grupo[0], grupo[-1]
+        if url == URL_ARCHIVE:
+            daily_params = [p for p in DAILY_PARAMS if p not in DAILY_PARAMS_NAO_SUPORTADOS_NO_ARQUIVO]
+        else:
+            daily_params = DAILY_PARAMS
+
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "start_date": inicio,
+            "end_date": fim,
+            "daily": ",".join(daily_params),
+            "hourly": ",".join(HOURLY_PARAMS),
+            "timezone": FUSO_HORARIO,
         }
 
-    except requests.exceptions.RequestException as e:
-        print(f"  [ERRO] Falha ao baixar dados diários para {data}: {e}")
-        return None
+        dados = baixar_com_retry(url, params, session)
+        if not dados: continue
 
+        if "daily" in dados and dados["daily"]:
+            diario.extend(parse_diario(dados["daily"], lat, lon, dados.get("timezone"), grupo))
+        if "hourly" in dados and dados["hourly"]:
+            horario.extend(parse_horario(dados["hourly"], lat, lon, grupo))
 
-def baixar_dados_horarios(data):
-    """
-    Baixa dados horários da API Open-Meteo para uma data específica.
-    Retorna uma lista de dicionários (um por hora) ou None em caso de erro.
-    """
+    return {"diario": diario, "horario": horario}
+
+def baixar_qualidade_ar_bloco(datas, lat, lon, session):
+    datas = [d for d in datas if d >= DATA_MINIMA_QUALIDADE_AR]
+    if not datas: return []
+
+    inicio, fim = datas[0], datas[-1]
     params = {
-        "latitude": LATITUDE,
-        "longitude": LONGITUDE,
-        "start_date": data,
-        "end_date": data,
-        "hourly": ",".join(HOURLY_PARAMS),
-        "timezone": FUSO_HORARIO,
-    }
-
-    try:
-        response = requests.get(URL_FORECAST, params=params, timeout=30)
-        response.raise_for_status()
-        dados = response.json()
-
-        if "hourly" not in dados or not dados["hourly"]:
-            print(f"  [AVISO] Nenhum dado horário retornado para {data}")
-            return None
-
-        hourly = dados["hourly"]
-        times = hourly.get("time", [])
-        resultados = []
-
-        for i, hora_str in enumerate(times):
-            resultados.append({
-                "data": data,
-                "hora": hora_str,
-                "temperatura": hourly.get("temperature_2m", [None])[i],
-                "sensacao_termica": hourly.get("apparent_temperature", [None])[i],
-                "umidade": hourly.get("relativehumidity_2m", [None])[i],
-                "ponto_orvalho": hourly.get("dewpoint_2m", [None])[i],
-                "precipitacao": hourly.get("precipitation", [None])[i],
-                "probabilidade_chuva": hourly.get("precipitation_probability", [None])[i],
-                "chuva": hourly.get("rain", [None])[i],
-                "aguas_claras": hourly.get("showers", [None])[i],
-                "neve": hourly.get("snowfall", [None])[i],
-                "profundidade_neve": hourly.get("snow_depth", [None])[i],
-                "uv_index": hourly.get("uv_index", [None])[i],
-                "uv_index_clear_sky": hourly.get("uv_index_clear_sky", [None])[i],
-                "vento": hourly.get("windspeed_10m", [None])[i],
-                "direcao_vento": hourly.get("winddirection_10m", [None])[i],
-                "rajadas_vento": hourly.get("windgusts_10m", [None])[i],
-                "pressao": hourly.get("pressure_msl", [None])[i],
-                "pressao_superficie": hourly.get("surface_pressure", [None])[i],
-                "cobertura_nuvens": hourly.get("cloudcover", [None])[i],
-                "cobertura_nuvens_baixa": hourly.get("cloudcover_low", [None])[i],
-                "cobertura_nuvens_media": hourly.get("cloudcover_mid", [None])[i],
-                "cobertura_nuvens_alta": hourly.get("cloudcover_high", [None])[i],
-                "visibilidade": hourly.get("visibility", [None])[i],
-                "is_day": hourly.get("is_day", [None])[i],
-                "weathercode": hourly.get("weathercode", [None])[i],
-            })
-
-        return resultados
-
-    except requests.exceptions.RequestException as e:
-        print(f"  [ERRO] Falha ao baixar dados horários para {data}: {e}")
-        return None
-
-
-def baixar_qualidade_ar(data):
-    """
-    Baixa dados de qualidade do ar da API Open-Meteo para uma data específica.
-    Retorna uma lista de dicionários (um por hora) ou None em caso de erro.
-    """
-    params = {
-        "latitude": LATITUDE,
-        "longitude": LONGITUDE,
-        "start_date": data,
-        "end_date": data,
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": inicio,
+        "end_date": fim,
         "hourly": ",".join(AIR_QUALITY_HOURLY),
         "timezone": FUSO_HORARIO,
     }
 
-    try:
-        response = requests.get(URL_AIR_QUALITY, params=params, timeout=30)
-        response.raise_for_status()
-        dados = response.json()
+    dados = baixar_com_retry(URL_AIR_QUALITY, params, session)
+    if not dados or "hourly" not in dados: return []
+    return parse_qualidade_ar(dados["hourly"], lat, lon, datas)
 
-        if "hourly" not in dados or not dados["hourly"]:
-            print(f"  [AVISO] Nenhum dado de qualidade do ar retornado para {data}")
-            return None
+def baixar_polen_bloco(datas, lat, lon, session):
+    hoje = datetime.now().date()
+    datas = [d for d in datas if datetime.strptime(d, "%Y-%m-%d").date() >= hoje]
+    if not datas: return []
 
-        hourly = dados["hourly"]
-        times = hourly.get("time", [])
-        resultados = []
-
-        for i, hora_str in enumerate(times):
-            resultados.append({
-                "data": data,
-                "hora": hora_str,
-                "pm10": hourly.get("pm10", [None])[i],
-                "pm2_5": hourly.get("pm2_5", [None])[i],
-                "monoxido_carbono": hourly.get("carbon_monoxide", [None])[i],
-                "nitrogenio_dioxide": hourly.get("nitrogen_dioxide", [None])[i],
-                "enxofre_dioxide": hourly.get("sulfur_dioxide", [None])[i],
-                "ozonio": hourly.get("ozone", [None])[i],
-                "aerosois": hourly.get("aerosol", [None])[i],
-                "poeira": hourly.get("dust", [None])[i],
-                "amonio": hourly.get("ammonium", [None])[i],
-                "radon": hourly.get("radon", [None])[i],
-                "formaldeido": hourly.get("formaldehyde", [None])[i],
-                "mercurio": hourly.get("mercury", [None])[i],
-            })
-
-        return resultados
-
-    except requests.exceptions.RequestException as e:
-        print(f"  [ERRO] Falha ao baixar qualidade do ar para {data}: {e}")
-        return None
-
-
-def baixar_dados_polen(data):
-    """
-    Baixa dados de polen da API Open-Meteo para uma data específica.
-    Retorna um dicionário com os dados ou None em caso de erro.
-    """
+    inicio, fim = datas[0], datas[-1]
     params = {
-        "latitude": LATITUDE,
-        "longitude": LONGITUDE,
-        "start_date": data,
-        "end_date": data,
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": inicio,
+        "end_date": fim,
         "daily": ",".join(POLLEN_DAILY),
         "timezone": FUSO_HORARIO,
     }
 
-    try:
-        response = requests.get(URL_POLLEN, params=params, timeout=30)
-        response.raise_for_status()
-        dados = response.json()
+    dados = baixar_com_retry(URL_POLLEN, params, session)
+    if not dados or "daily" not in dados: return []
+    return parse_polen(dados["daily"], lat, lon, datas)
 
-        if "daily" not in dados or not dados["daily"]:
-            print(f"  [AVISO] Nenhum dado de polen retornado para {data}")
-            return None
-
-        daily = dados["daily"]
-        idx = 0
-
-        return {
-            "data": data,
-            "latitude": dados.get("latitude"),
-            "longitude": dados.get("longitude"),
-            "alder_pollen_mean": daily.get("alder_pollen_mean", [None])[idx],
-            "birch_pollen_mean": daily.get("birch_pollen_mean", [None])[idx],
-            "olive_pollen_mean": daily.get("olive_pollen_mean", [None])[idx],
-            "ragweed_pollen_mean": daily.get("ragweed_pollen_mean", [None])[idx],
-            "grass_pollen_mean": daily.get("grass_pollen_mean", [None])[idx],
-        }
-
-    except requests.exceptions.RequestException as e:
-        print(f"  [ERRO] Falha ao baixar polen para {data}: {e}")
-        return None
-
-
-# ============================================================================
-# FUNÇÕES DE SALVAMENTO NO BANCO
-# ============================================================================
-
-def salvar_dados_diarios(dados):
-    """Salva os dados diários no banco de dados."""
+# Salvamento em lote (executemany)
+def salvar_dados_diarios(registros):
+    if not registros: return
     conn = get_connection()
     cursor = conn.cursor()
-
-    cursor.execute("""
+    agora = datetime.now().isoformat()
+    cursor.executemany("""
         INSERT OR REPLACE INTO clima_diario (
             data, latitude, longitude, timezone, weathercode,
             temperatura_max, temperatura_min,
@@ -554,46 +626,45 @@ def salvar_dados_diarios(dados):
             pressao_superficie_max, pressao_superficie_min,
             created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        dados["data"], dados["latitude"], dados["longitude"], dados["timezone"],
-        dados["weathercode"], dados["temperatura_max"], dados["temperatura_min"],
-        dados["sensacao_termica_max"], dados["sensacao_termica_min"],
-        dados["umidade_max"], dados["umidade_min"],
-        dados["precipitacao_total"], dados["probabilidade_chuva"],
-        dados["chuva_total"], dados["aguas_claras_total"], dados["neve_total"],
-        dados["nascer_sol"], dados["por_sol"], dados["nascer_lua"], dados["por_lua"],
-        dados["uv_max"], dados["uv_clear_sky_max"],
-        dados["vento_max"], dados["direcao_vento"], dados["rajadas_vento"],
-        dados["pressao_max"], dados["pressao_min"],
-        dados["pressao_superficie_max"], dados["pressao_superficie_min"],
-        datetime.now().isoformat()
-    ))
-
+    """, [
+        (
+            r["data"], r["latitude"], r["longitude"], r["timezone"],
+            r["weathercode"], r["temperatura_max"], r["temperatura_min"],
+            r["sensacao_termica_max"], r["sensacao_termica_min"],
+            r["umidade_max"], r["umidade_min"],
+            r["precipitacao_total"], r["probabilidade_chuva"],
+            r["chuva_total"], r["aguas_claras_total"], r["neve_total"],
+            r["nascer_sol"], r["por_sol"], r["nascer_lua"], r["por_lua"],
+            r["uv_max"], r["uv_clear_sky_max"],
+            r["vento_max"], r["direcao_vento"], r["rajadas_vento"],
+            r["pressao_max"], r["pressao_min"],
+            r["pressao_superficie_max"], r["pressao_superficie_min"],
+            agora,
+        ) for r in registros
+    ])
     conn.commit()
-    conn.close()
-    print(f"  [OK] Dados diários salvos para {dados['data']}")
 
-
-def salvar_dados_horarios(lista_horarios):
-    """Salva os dados horários no banco de dados."""
+def salvar_dados_horarios(registros):
+    if not registros: return
     conn = get_connection()
     cursor = conn.cursor()
-
-    for h in lista_horarios:
-        cursor.execute("""
-            INSERT OR REPLACE INTO clima_horario (
-                data, hora, temperatura, sensacao_termica, umidade,
-                ponto_orvalho, precipitacao, probabilidade_chuva,
-                chuva, aguas_claras, neve, profundidade_neve,
-                uv_index, uv_index_clear_sky,
-                vento, direcao_vento, rajadas_vento,
-                pressao, pressao_superficie,
-                cobertura_nuvens, cobertura_nuvens_baixa,
-                cobertura_nuvens_media, cobertura_nuvens_alta,
-                visibilidade, is_day, weathercode, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            h["data"], h["hora"], h["temperatura"], h["sensacao_termica"],
+    agora = datetime.now().isoformat()
+    cursor.executemany("""
+        INSERT OR REPLACE INTO clima_horario (
+            data, hora, latitude, longitude, temperatura, sensacao_termica, umidade,
+            ponto_orvalho, precipitacao, probabilidade_chuva,
+            chuva, aguas_claras, neve, profundidade_neve,
+            uv_index, uv_index_clear_sky,
+            vento, direcao_vento, rajadas_vento,
+            pressao, pressao_superficie,
+            cobertura_nuvens, cobertura_nuvens_baixa,
+            cobertura_nuvens_media, cobertura_nuvens_alta,
+            visibilidade, is_day, weathercode, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [
+        (
+            h["data"], h["hora"], h["latitude"], h["longitude"],
+            h["temperatura"], h["sensacao_termica"],
             h["umidade"], h["ponto_orvalho"], h["precipitacao"],
             h["probabilidade_chuva"], h["chuva"], h["aguas_claras"],
             h["neve"], h["profundidade_neve"], h["uv_index"],
@@ -602,152 +673,208 @@ def salvar_dados_horarios(lista_horarios):
             h["cobertura_nuvens"], h["cobertura_nuvens_baixa"],
             h["cobertura_nuvens_media"], h["cobertura_nuvens_alta"],
             h["visibilidade"], h["is_day"], h["weathercode"],
-            datetime.now().isoformat()
-        ))
-
+            agora,
+        ) for h in registros
+    ])
     conn.commit()
-    conn.close()
-    print(f"  [OK] {len(lista_horarios)} registros horários salvos para {lista_horarios[0]['data']}")
 
-
-def salvar_qualidade_ar(lista_dados):
-    """Salva os dados de qualidade do ar no banco de dados."""
+def salvar_qualidade_ar(registros):
+    if not registros: return
     conn = get_connection()
     cursor = conn.cursor()
-
-    for d in lista_dados:
-        cursor.execute("""
-            INSERT OR REPLACE INTO qualidade_ar (
-                data, hora, pm10, pm2_5, monoxido_carbono,
-                nitrogenio_dioxide, enxofre_dioxide, ozonio,
-                aerosois, poeira, amonio, radon,
-                formaldeido, mercurio, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            d["data"], d["hora"], d["pm10"], d["pm2_5"],
+    agora = datetime.now().isoformat()
+    cursor.executemany("""
+        INSERT OR REPLACE INTO qualidade_ar (
+            data, hora, latitude, longitude, pm10, pm2_5, monoxido_carbono,
+            nitrogenio_dioxide, enxofre_dioxide, ozonio,
+            aerosois, poeira, amonio, radon,
+            formaldeido, mercurio, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [
+        (
+            d["data"], d["hora"], d["latitude"], d["longitude"],
+            d["pm10"], d["pm2_5"],
             d["monoxido_carbono"], d["nitrogenio_dioxide"],
-            d["enxofre_dioxide"], d["ozonio"], d["aerosois"],
-            d["poeira"], d["amonio"], d["radon"],
-            d["formaldeido"], d["mercurio"],
-            datetime.now().isoformat()
-        ))
-
+            d.get("enxofre_dioxide"), d["ozonio"], d.get("aerosois"),
+            d["poeira"], d.get("amonio"), d.get("radon"),
+            d["formaldeido"], d.get("mercurio"),
+            agora,
+        ) for d in registros
+    ])
     conn.commit()
-    conn.close()
-    print(f"  [OK] {len(lista_dados)} registros de qualidade do ar salvos para {lista_dados[0]['data']}")
 
-
-def salvar_dados_polen(dados):
-    """Salva os dados de polen no banco de dados."""
+def salvar_dados_polen(registros):
+    if not registros: return
     conn = get_connection()
     cursor = conn.cursor()
-
-    cursor.execute("""
+    agora = datetime.now().isoformat()
+    cursor.executemany("""
         INSERT OR REPLACE INTO polen (
             data, latitude, longitude,
             alder_pollen_mean, birch_pollen_mean,
             olive_pollen_mean, ragweed_pollen_mean,
             grass_pollen_mean, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        dados["data"], dados["latitude"], dados["longitude"],
-        dados["alder_pollen_mean"], dados["birch_pollen_mean"],
-        dados["olive_pollen_mean"], dados["ragweed_pollen_mean"],
-        dados["grass_pollen_mean"],
-        datetime.now().isoformat()
-    ))
-
+    """, [
+        (
+            p["data"], p["latitude"], p["longitude"],
+            p["alder_pollen_mean"], p["birch_pollen_mean"],
+            p["olive_pollen_mean"], p["ragweed_pollen_mean"],
+            p["grass_pollen_mean"], agora,
+        ) for p in registros
+    ])
     conn.commit()
-    conn.close()
-    print(f"  [OK] Dados de polen salvos para {dados['data']}")
 
+# Processamento de um bloco de datas para uma localização
+def expandir_periodo(periodo):
+    if len(periodo) == 2:
+        try:
+            data_inicio = datetime.strptime(periodo[0], "%Y-%m-%d")
+            data_fim = datetime.strptime(periodo[1], "%Y-%m-%d")
+            datas = []
+            data_atual = data_inicio
+            while data_atual <= data_fim:
+                datas.append(data_atual.strftime("%Y-%m-%d"))
+                data_atual += timedelta(days=1)
+            return datas
+        except ValueError as e:
+            print(f"[AVISO] Erro ao processar datas do período: {e}")
+            return periodo
+    return periodo
 
-# ============================================================================
-# FUNÇÃO PRINCIPAL
-# ============================================================================
+def processar_bloco(datas, lat, lon, existentes, stats):
+    # Jitter inicial: dessincroniza as threads para que não comecem todas ao mesmo tempo
+    # (evita rajadas de requisições simultâneas que causam HTTP 429).
+    time.sleep(random.uniform(0.0, JITTER_INICIAL_MAX))
 
-def processar_data(data):
-    """
-    Processa uma única data: verifica se já existe no banco,
-    e se não existir, baixa e salva todos os dados.
-    """
-    print(f"\n{'='*60}")
-    print(f"Processando: {data}")
-    print(f"{'='*60}")
+    chave = lambda d: (d, float(lat), float(lon))
 
-    # --- Dados diários ---
-    if data_diaria_existe(data):
-        print(f"  [PULADO] Dados diários já existem para {data}")
-    else:
-        print(f"  Baixando dados diários para {data}...")
-        dados_diarios = baixar_dados_diarios(data)
-        if dados_diarios:
-            salvar_dados_diarios(dados_diarios)
-        else:
-            print(f"  [FALHA] Não foi possível baixar dados diários para {data}")
+    # Filtra apenas o que ainda não existe (verificação em memória, O(1))
+    datas_diario = [d for d in datas if chave(d) not in existentes["diario"]]
+    datas_horario = [d for d in datas if chave(d) not in existentes["horario"]]
+    datas_ar = [d for d in datas if d >= DATA_MINIMA_QUALIDADE_AR and chave(d) not in existentes["qualidade_ar"]]
+    hoje = datetime.now().date()
+    datas_polen = [
+        d for d in datas
+        if datetime.strptime(d, "%Y-%m-%d").date() >= hoje
+        and chave(d) not in existentes["polen"]
+    ]
 
-    # --- Dados horários ---
-    if data_horaria_existe(data):
-        print(f"  [PULADO] Dados horários já existem para {data}")
-    else:
-        print(f"  Baixando dados horários para {data}...")
-        dados_horarios = baixar_dados_horarios(data)
-        if dados_horarios:
-            salvar_dados_horarios(dados_horarios)
-        else:
-            print(f"  [FALHA] Não foi possível baixar dados horários para {data}")
+    stats["pulado_diario"] += len(datas) - len(datas_diario)
+    stats["pulado_horario"] += len(datas) - len(datas_horario)
+    stats["pulado_ar"] += len(datas) - len(datas_ar) - sum(1 for d in datas if d < DATA_MINIMA_QUALIDADE_AR)
+    stats["pulado_polen"] += len(datas) - len(datas_polen) - sum(1 for d in datas if datetime.strptime(d, "%Y-%m-%d").date() < hoje)
 
-    # --- Qualidade do ar ---
-    if qualidade_ar_existe(data):
-        print(f"  [PULADO] Dados de qualidade do ar já existem para {data}")
-    else:
-        print(f"  Baixando qualidade do ar para {data}...")
-        dados_ar = baixar_qualidade_ar(data)
-        if dados_ar:
-            salvar_qualidade_ar(dados_ar)
-        else:
-            print(f"  [FALHA] Não foi possível baixar qualidade do ar para {data}")
+    session = get_session()
 
-    # --- Polen ---
-    if polen_existe(data):
-        print(f"  [PULADO] Dados de polen já existem para {data}")
-    else:
-        print(f"  Baixando dados de polen para {data}...")
-        dados_polen = baixar_dados_polen(data)
-        if dados_polen:
-            salvar_dados_polen(dados_polen)
-        else:
-            print(f"  [FALHA] Não foi possível baixar polen para {data}")
+    # Clima (diário + horário na MESMA requisição)
+    if datas_diario or datas_horario:
+        alvo = sorted(set(datas_diario + datas_horario))
+        resultado = baixar_clima_bloco(alvo, lat, lon, session)
+        if resultado["diario"]:
+            with write_lock: salvar_dados_diarios(resultado["diario"])
+            for r in resultado["diario"]:
+                existentes["diario"].add((r["data"], float(lat), float(lon)))
+            stats["baixado_diario"] += len(resultado["diario"])
+        if resultado["horario"]:
+            with write_lock: salvar_dados_horarios(resultado["horario"])
+            for r in resultado["horario"]:
+                existentes["horario"].add((r["data"], float(lat), float(lon)))
+            stats["baixado_horario"] += len(resultado["horario"])
 
-    # Pequena pausa entre requisições para não sobrecarregar a API
-    time.sleep(1)
+    # Qualidade do ar
+    if datas_ar:
+        resultado_ar = baixar_qualidade_ar_bloco(datas_ar, lat, lon, session)
+        if resultado_ar:
+            with write_lock: salvar_qualidade_ar(resultado_ar)
+            for r in resultado_ar:
+                existentes["qualidade_ar"].add((r["data"], float(lat), float(lon)))
+            stats["baixado_ar"] += len(resultado_ar)
 
+    # Pólen
+    if datas_polen:
+        resultado_polen = baixar_polen_bloco(datas_polen, lat, lon, session)
+        if resultado_polen:
+            with write_lock: salvar_dados_polen(resultado_polen)
+            for r in resultado_polen:
+                existentes["polen"].add((r["data"], float(lat), float(lon)))
+            stats["baixado_polen"] += len(resultado_polen)
 
 def main():
-    """Função principal - executa o download para todas as datas do período."""
+    datas = expandir_periodo(PERIODO_DOWNLOAD)
     print("=" * 60)
     print("DOWNLOAD DE DADOS CLIMÁTICOS - Open-Meteo API (gratuita)")
     print("=" * 60)
-    print(f"Localização: {LATITUDE}, {LONGITUDE}")
     print(f"Fuso horário: {FUSO_HORARIO}")
     print(f"Banco de dados: {DB_PATH}")
-    print(f"Período: {PERIODO_DOWNLOAD[0]} a {PERIODO_DOWNLOAD[-1]}")
-    print(f"Total de datas: {len(PERIODO_DOWNLOAD)}")
+    print(f"Período: {datas[0]} a {datas[-1]}")
+    print(f"Total de datas: {len(datas)}")
+    print(f"Total de localizações: {len(COORDENADAS)}")
+    print(f"Threads (MAX_WORKERS): {MAX_WORKERS}")
+    print(f"Dias por requisição (CHUNK_DIAS): {CHUNK_DIAS}")
+    print(f"Rate-limit global (RPS): {REQUESTS_PER_SECOND}")
+    print(f"Timeout HTTP: {HTTP_TIMEOUT}s")
+    print(f"Retries máximos: {MAX_RETRIES}")
     print("=" * 60)
 
-    # Inicializa o banco de dados
     init_database()
 
-    # Processa cada data do array PERIODO_DOWNLOAD (dia por dia)
-    total = len(PERIODO_DOWNLOAD)
-    for i, data in enumerate(PERIODO_DOWNLOAD, 1):
-        print(f"\n[{i}/{total}] ", end="")
-        processar_data(data)
+    existentes = carregar_existentes()
+    print(f"[DB] Itens já existentes -> diário: {len(existentes['diario'])}, "
+          f"horário: {len(existentes['horario'])}, "
+          f"qualidade do ar: {len(existentes['qualidade_ar'])}, "
+          f"pólen: {len(existentes['polen'])}")
 
+    # Cria as tarefas: cada bloco de datas + localização vira uma thread
+    tarefas = []
+    for lat, lon in COORDENADAS:
+        for i in range(0, len(datas), CHUNK_DIAS): tarefas.append((datas[i:i + CHUNK_DIAS], lat, lon))
+
+    stats = {
+        "baixado_diario": 0,
+        "baixado_horario": 0,
+        "baixado_ar": 0,
+        "baixado_polen": 0,
+        "pulado_diario": 0,
+        "pulado_horario": 0,
+        "pulado_ar": 0,
+        "pulado_polen": 0,
+    }
+    stats_lock = threading.Lock()
+    concluidos = 0
+    total = len(tarefas)
+    inicio = time.time()
+
+    def executar(tarefa):
+        nonlocal concluidos
+        datas_bloco, lat, lon = tarefa
+        processar_bloco(datas_bloco, lat, lon, existentes, stats)
+        with stats_lock:
+            concluidos += 1
+            pct = concluidos / total * 100
+            decorrido = time.time() - inicio
+            if concluidos % 5 == 0 or concluidos == total:
+                print(f"\r[PROGRESSO] {concluidos}/{total} blocos ({pct:.1f}%) "
+                      f"- {decorrido:.0f}s", end="", flush=True)
+
+    print(f"\nIniciando {total} tarefas com {MAX_WORKERS} threads...\n")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(executar, t) for t in tarefas]
+        for future in as_completed(futures): future.result()
+
+    print()
     print("\n" + "=" * 60)
     print("DOWNLOAD CONCLUÍDO!")
     print("=" * 60)
-
+    print(f"Tempo total: {time.time() - inicio:.1f}s")
+    print(f"Blocos processados: {concluidos}/{total}")
+    print("\n--- RESUMO ---")
+    print(f"  Diário: {stats['baixado_diario']} baixados | {stats['pulado_diario']} já existentes")
+    print(f"  Horário: {stats['baixado_horario']} registros baixados | {stats['pulado_horario']} dias já existentes")
+    print(f"  Qualidade do ar: {stats['baixado_ar']} registros baixados | {stats['pulado_ar']} dias já existentes")
+    print(f"  Pólen: {stats['baixado_polen']} dias baixados | {stats['pulado_polen']} dias já existentes")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()

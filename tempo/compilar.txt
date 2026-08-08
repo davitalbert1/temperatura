@@ -1,0 +1,4 @@
+qmake clima_viewer.pro
+make
+
+./release/clima_viewer.exe

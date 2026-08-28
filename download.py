@@ -4,6 +4,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue, Empty
 from datetime import datetime, timedelta
 from typing import Dict, List, Set, Tuple, Any, Optional
 import requests
@@ -12,7 +13,8 @@ from urllib3.util.retry import Retry
 
 DB_PATH = "clima.db"
 MAX_SQL_DATES_POR_LOTE = 900
-MAX_WORKERS = int(os.environ.get("OPENMETEO_WORKERS", "2"))
+DOWNLOAD_WORKERS = int(os.environ.get("OPENMETEO_DOWNLOAD_WORKERS", "5"))
+PROCESS_WORKERS = int(os.environ.get("OPENMETEO_PROCESS_WORKERS", "2"))
 CHUNK_DIAS = int(os.environ.get("OPENMETEO_CHUNK_DIAS", "30"))
 REQUESTS_PER_SECOND = float(os.environ.get("OPENMETEO_RPS", "4"))
 MAX_RETRIES = int(os.environ.get("OPENMETEO_RETRIES", "8"))
@@ -20,7 +22,7 @@ HTTP_TIMEOUT = float(os.environ.get("OPENMETEO_TIMEOUT", "120"))
 JITTER_INICIAL_MAX = float(os.environ.get("OPENMETEO_JITTER", "5.0"))
 BACKOFF_INICIAL = float(os.environ.get("OPENMETEO_BACKOFF", "2.0"))
 BACKOFF_MAXIMO = float(os.environ.get("OPENMETEO_BACKOFF_MAX", "60.0"))
-MIN_RPS = float(os.environ.get("OPENMETEO_MIN_RPS", "0.5"))
+MIN_RPS = float(os.environ.get("OPENMETEO_MIN_RPS", "5"))
 COOLDOWN_429 = float(os.environ.get("OPENMETEO_COOLDOWN_429", "30.0"))
 CIRCUIT_LIMIT_429 = int(os.environ.get("OPENMETEO_429_CIRCUIT_LIMIT", "3"))
 ESPERA_MIN_429 = float(os.environ.get("OPENMETEO_429_ESPERA_MIN", "5.0"))
@@ -47,7 +49,7 @@ COORDENADAS = [
 ]
 
 FUSO_HORARIO = "America/Sao_Paulo"
-PERIODO_DOWNLOAD = ["2000-01-01", "2024-01-05"]
+PERIODO_DOWNLOAD = ["1940-01-01", "2025-12-31"]
 
 # URLs das APIs
 # - Histórico disponível: aproximadamente os últimos 92 dias.
@@ -218,8 +220,8 @@ def get_session() -> requests.Session:
         )
         adapter = HTTPAdapter(
             max_retries=retry,
-            pool_connections=MAX_WORKERS + 2,
-            pool_maxsize=MAX_WORKERS + 2
+            pool_connections=DOWNLOAD_WORKERS + 2,
+            pool_maxsize=DOWNLOAD_WORKERS + 2
         )
         session.mount("https://", adapter)
         session.mount("http://", adapter)
@@ -387,7 +389,6 @@ def init_database() -> None:
     log("[DB] Banco inicializado.")
 
 def carregar_existentes(datas: List[str], coordenadas: List) -> Dict[str, Dict]:
-    """Carrega datas já existentes no banco por tipo e coordenada."""
     conn = get_connection()
     cursor = conn.cursor()
     existentes = {"diario": {}, "horario": {}, "qualidade_ar": {}, "polen": {}}
@@ -405,19 +406,16 @@ def carregar_existentes(datas: List[str], coordenadas: List) -> Dict[str, Dict]:
             datas_filtradas = [d for d in datas if d >= DATA_MINIMA_QUALIDADE_AR]
         elif tipo == "polen":
             hoje = datetime.now().date()
-            datas_filtradas = [d for d in datas
-                             if datetime.strptime(d, "%Y-%m-%d").date() >= hoje]
+            datas_filtradas = [d for d in datas if datetime.strptime(d, "%Y-%m-%d").date() >= hoje]
         else:
             datas_filtradas = datas
 
-        if not datas_filtradas:
-            continue
+        if not datas_filtradas: continue
 
         # Carrega em lotes por coordenada
         for lat, lon in coordenadas:
             chave = (float(lat), float(lon))
-            if chave not in existentes[tipo]:
-                existentes[tipo][chave] = set()
+            if chave not in existentes[tipo]: existentes[tipo][chave] = set()
 
             for i in range(0, len(datas_filtradas), MAX_SQL_DATES_POR_LOTE):
                 lote = datas_filtradas[i:i + MAX_SQL_DATES_POR_LOTE]
@@ -428,13 +426,8 @@ def carregar_existentes(datas: List[str], coordenadas: List) -> Dict[str, Dict]:
 
     return existentes
 
-# ==================== PARSING GENÉRICO ====================
-def parse_registros(dados: Dict, lat: float, lon: float, tipo: str,
-                    datas_filtro: Optional[Set[str]] = None) -> List[Dict]:
-    """
-    Parse genérico para diferentes tipos de dados.
-    tipo: 'diario', 'horario', 'qualidade_ar', 'polen'
-    """
+# PARSING GENÉRICO
+def parse_registros(dados: Dict, lat: float, lon: float, tipo: str, datas_filtro: Optional[Set[str]] = None) -> List[Dict]:
     filtro = datas_filtro
     times = dados.get("time", [])
     registros = []
@@ -520,13 +513,11 @@ def parse_registros(dados: Dict, lat: float, lon: float, tipo: str,
     }
 
     mapeamento = mapeamentos.get(tipo, {})
-    if not mapeamento:
-        return []
+    if not mapeamento: return []
 
     for i, _ in enumerate(times):
         data = times[i][:10] if len(times[i]) > 10 else times[i]
-        if filtro and data not in filtro:
-            continue
+        if filtro and data not in filtro: continue
 
         registro = {"latitude": lat, "longitude": lon}
         for campo, (chave, func) in mapeamento.items():
@@ -551,7 +542,6 @@ def baixar_com_retry(url: str, params: Dict, session: requests.Session,
             response.raise_for_status()
             _restaurar_taxa()
             return response.json()
-
         except requests.exceptions.HTTPError as e:
             status = getattr(e.response, "status_code", None)
             if status == 429:
@@ -570,7 +560,6 @@ def baixar_com_retry(url: str, params: Dict, session: requests.Session,
                 espera = _backoff_exponencial(tentativa)
                 log(f"  [RETRY {tentativa}/{max_tentativas}] HTTP {status}: {e}. Aguardando {espera:.1f}s...")
                 time.sleep(espera)
-
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             if tentativa == max_tentativas:
                 log(f"  [ERRO] Falha após {max_tentativas} tentativas: {e}")
@@ -582,23 +571,17 @@ def baixar_com_retry(url: str, params: Dict, session: requests.Session,
     return None
 
 def _extrair_retry_after(response: requests.Response) -> Optional[float]:
-    try:
-        return float(response.headers.get("Retry-After", ""))
-    except (TypeError, ValueError):
-        return None
+    try: return float(response.headers.get("Retry-After", ""))
+    except (TypeError, ValueError): return None
 
 def _backoff_exponencial(tentativa: int) -> float:
-    """Calcula backoff exponencial com jitter."""
-    return min(BACKOFF_MAXIMO,
-               (BACKOFF_INICIAL * (2 ** (tentativa - 1))) * random.uniform(0.5, 1.5))
+    return min(BACKOFF_MAXIMO, (BACKOFF_INICIAL * (2 ** (tentativa - 1))) * random.uniform(0.5, 1.5))
 
 def agrupar_por_url(datas: List[str], chunk: int = CHUNK_DIAS) -> List[Tuple[str, List[str]]]:
-    """Agrupa datas por URL (archive/forecast) em chunks."""
     grupos = []
     for url in (URL_ARCHIVE, URL_FORECAST):
         lista = sorted(d for d in datas if get_url_clima(d) == url)
-        for i in range(0, len(lista), chunk):
-            grupos.append((url, lista[i:i + chunk]))
+        for i in range(0, len(lista), chunk): grupos.append((url, lista[i:i + chunk]))
     return grupos
 
 def baixar_clima_bloco(datas: List[str], lat: float, lon: float,
@@ -690,38 +673,92 @@ def salvar_dados(tabela: str, registros: List[Dict], campos: List[str]) -> None:
 # Definições de schema para cada tabela
 SCHEMAS = {
     "clima_diario": [
-        "data", "latitude", "longitude", "timezone", "weathercode",
-        "temperatura_max", "temperatura_min", "sensacao_termica_max",
-        "sensacao_termica_min", "umidade_max", "umidade_min",
-        "precipitacao_total", "probabilidade_chuva", "chuva_total",
-        "aguas_claras_total", "neve_total", "nascer_sol", "por_sol",
-        "uv_max", "uv_clear_sky_max", "vento_max", "direcao_vento",
-        "rajadas_vento", "pressao_max", "pressao_min",
-        "pressao_superficie_max", "pressao_superficie_min",
+        "data",
+        "latitude",
+        "longitude",
+        "timezone",
+        "weathercode",
+        "temperatura_max",
+        "temperatura_min",
+        "sensacao_termica_max",
+        "sensacao_termica_min",
+        "umidade_max",
+        "umidade_min",
+        "precipitacao_total",
+        "probabilidade_chuva",
+        "chuva_total",
+        "aguas_claras_total",
+        "neve_total",
+        "nascer_sol",
+        "por_sol",
+        "uv_max",
+        "uv_clear_sky_max",
+        "vento_max",
+        "direcao_vento",
+        "rajadas_vento",
+        "pressao_max",
+        "pressao_min",
+        "pressao_superficie_max",
+        "pressao_superficie_min",
     ],
     "clima_horario": [
-        "data", "hora", "latitude", "longitude", "temperatura",
-        "sensacao_termica", "umidade", "ponto_orvalho", "precipitacao",
-        "probabilidade_chuva", "chuva", "aguas_claras", "neve",
-        "profundidade_neve", "uv_index", "uv_index_clear_sky", "vento",
-        "direcao_vento", "rajadas_vento", "pressao", "pressao_superficie",
-        "cobertura_nuvens", "cobertura_nuvens_baixa", "cobertura_nuvens_media",
-        "cobertura_nuvens_alta", "visibilidade", "is_day", "weathercode",
+        "data",
+        "hora",
+        "latitude",
+        "longitude",
+        "temperatura",
+        "sensacao_termica",
+        "umidade",
+        "ponto_orvalho",
+        "precipitacao",
+        "probabilidade_chuva",
+        "chuva",
+        "aguas_claras",
+        "neve",
+        "profundidade_neve",
+        "uv_index",
+        "uv_index_clear_sky",
+        "vento",
+        "direcao_vento",
+        "rajadas_vento",
+        "pressao",
+        "pressao_superficie",
+        "cobertura_nuvens",
+        "cobertura_nuvens_baixa",
+        "cobertura_nuvens_media",
+        "cobertura_nuvens_alta",
+        "visibilidade",
+        "is_day",
+        "weathercode",
     ],
     "qualidade_ar": [
-        "data", "hora", "latitude", "longitude", "pm10", "pm2_5",
-        "monoxido_carbono", "nitrogenio_dioxide", "enxofre_dioxide",
-        "ozonio", "aerosois", "poeira", "formaldeido",
+        "data",
+        "hora",
+        "latitude",
+        "longitude",
+        "pm10",
+        "pm2_5",
+        "monoxido_carbono",
+        "nitrogenio_dioxide",
+        "enxofre_dioxide",
+        "ozonio",
+        "aerosois",
+        "poeira",
+        "formaldeido",
     ],
     "polen": [
-        "data", "latitude", "longitude", "alder_pollen_mean",
-        "birch_pollen_mean", "olive_pollen_mean", "ragweed_pollen_mean",
+        "data",
+        "latitude",
+        "longitude",
+        "alder_pollen_mean",
+        "birch_pollen_mean",
+        "olive_pollen_mean",
+        "ragweed_pollen_mean",
         "grass_pollen_mean",
     ],
 }
 
-def processar_bloco(datas: List[str], lat: float, lon: float,
-                    existentes: Dict, stats: Dict) -> None:
+def baixar_bloco(datas: List[str], lat: float, lon: float, existentes: Dict) -> Optional[Dict]:
     time.sleep(random.uniform(0.0, JITTER_INICIAL_MAX))
     chave_base = (float(lat), float(lon))
 
@@ -735,60 +772,74 @@ def processar_bloco(datas: List[str], lat: float, lon: float,
                    if datetime.strptime(d, "%Y-%m-%d").date() >= hoje
                    and d not in existentes["polen"].get(chave_base, set())]
 
-    # Atualiza estatísticas
-    stats["pulado_diario"] += len(datas) - len(datas_diario)
-    stats["pulado_horario"] += len(datas) - len(datas_horario)
-    stats["pulado_ar"] += len(datas) - len(datas_ar) - sum(1 for d in datas if d < DATA_MINIMA_QUALIDADE_AR)
-    stats["pulado_polen"] += (len(datas) - len(datas_polen) -
-                              sum(1 for d in datas if datetime.strptime(d, "%Y-%m-%d").date() < hoje))
-
     session = get_session()
+    resultado = {
+        "lat": lat,
+        "lon": lon,
+        "datas_diario": datas_diario,
+        "datas_horario": datas_horario,
+        "datas_ar": datas_ar,
+        "datas_polen": datas_polen,
+        "diario": [],
+        "horario": [],
+        "qualidade_ar": [],
+        "polen": [],
+    }
 
     # Download clima (diário + horário juntos)
     if datas_diario or datas_horario:
         alvo = sorted(set(datas_diario + datas_horario))
-        resultado = baixar_clima_bloco(alvo, lat, lon, session)
-
-        if resultado["diario"]:
-            faltantes = [r for r in resultado["diario"] if r["data"] in set(datas_diario)]
-            if faltantes:
-                with write_lock:
-                    salvar_dados("clima_diario", faltantes, SCHEMAS["clima_diario"])
-                existentes["diario"].setdefault(chave_base, set()).update(r["data"] for r in faltantes)
-                stats["baixado_diario"] += len(faltantes)
-
-        if resultado["horario"]:
-            faltantes = [r for r in resultado["horario"] if r["data"] in set(datas_horario)]
-            if faltantes:
-                with write_lock:
-                    salvar_dados("clima_horario", faltantes, SCHEMAS["clima_horario"])
-                existentes["horario"].setdefault(chave_base, set()).update(r["data"] for r in faltantes)
-                stats["baixado_horario"] += len(faltantes)
+        clima = baixar_clima_bloco(alvo, lat, lon, session)
+        resultado["diario"] = clima["diario"]
+        resultado["horario"] = clima["horario"]
 
     # Download qualidade do ar
-    if datas_ar:
-        resultado_ar = baixar_qualidade_ar_bloco(datas_ar, lat, lon, session)
-        if resultado_ar:
-            with write_lock:
-                salvar_dados("qualidade_ar", resultado_ar, SCHEMAS["qualidade_ar"])
-            existentes["qualidade_ar"].setdefault(chave_base, set()).update(r["data"] for r in resultado_ar)
-            stats["baixado_ar"] += len(resultado_ar)
+    if datas_ar: resultado["qualidade_ar"] = baixar_qualidade_ar_bloco(datas_ar, lat, lon, session)
 
     # Download pólen
-    if datas_polen:
-        resultado_polen = baixar_polen_bloco(datas_polen, lat, lon, session)
-        if resultado_polen:
-            with write_lock: salvar_dados("polen", resultado_polen, SCHEMAS["polen"])
-            existentes["polen"].setdefault(chave_base, set()).update(r["data"] for r in resultado_polen)
-            stats["baixado_polen"] += len(resultado_polen)
+    if datas_polen: resultado["polen"] = baixar_polen_bloco(datas_polen, lat, lon, session)
+
+    return resultado
+
+def processar_resultado(resultado: Dict, existentes: Dict, stats: Dict) -> None:
+    lat, lon = resultado["lat"], resultado["lon"]
+    chave_base = (float(lat), float(lon))
+
+    # Atualiza estatísticas de datas puladas
+    stats["pulado_diario"] += len(resultado["datas_diario"]) - len(resultado["diario"])
+    stats["pulado_horario"] += len(resultado["datas_horario"]) - len(resultado["horario"])
+    stats["pulado_ar"] += len(resultado["datas_ar"]) - len(resultado["qualidade_ar"])
+    stats["pulado_polen"] += len(resultado["datas_polen"]) - len(resultado["polen"])
+
+    # Insere clima diário
+    if resultado["diario"]:
+        with write_lock: salvar_dados("clima_diario", resultado["diario"], SCHEMAS["clima_diario"])
+        existentes["diario"].setdefault(chave_base, set()).update(r["data"] for r in resultado["diario"])
+        stats["baixado_diario"] += len(resultado["diario"])
+
+    # Insere clima horário
+    if resultado["horario"]:
+        with write_lock: salvar_dados("clima_horario", resultado["horario"], SCHEMAS["clima_horario"])
+        existentes["horario"].setdefault(chave_base, set()).update(r["data"] for r in resultado["horario"])
+        stats["baixado_horario"] += len(resultado["horario"])
+
+    # Insere qualidade do ar
+    if resultado["qualidade_ar"]:
+        with write_lock: salvar_dados("qualidade_ar", resultado["qualidade_ar"], SCHEMAS["qualidade_ar"])
+        existentes["qualidade_ar"].setdefault(chave_base, set()).update(r["data"] for r in resultado["qualidade_ar"])
+        stats["baixado_ar"] += len(resultado["qualidade_ar"])
+
+    # Insere pólen
+    if resultado["polen"]:
+        with write_lock: salvar_dados("polen", resultado["polen"], SCHEMAS["polen"])
+        existentes["polen"].setdefault(chave_base, set()).update(r["data"] for r in resultado["polen"])
+        stats["baixado_polen"] += len(resultado["polen"])
 
 def _filtrar_faltantes(datas: List[str], existentes: Set[str]) -> List[str]:
     return [d for d in datas if d not in existentes]
 
 def _datas_esperadas(tipo: str, datas: List[str]) -> Set[str]:
-    """Conjunto de datas que devem existir no banco para o tipo informado."""
-    if tipo == "qualidade_ar":
-        return {d for d in datas if d >= DATA_MINIMA_QUALIDADE_AR}
+    if tipo == "qualidade_ar": return {d for d in datas if d >= DATA_MINIMA_QUALIDADE_AR}
     if tipo == "polen":
         hoje = datetime.now().date()
         return {d for d in datas if datetime.strptime(d, "%Y-%m-%d").date() >= hoje}
@@ -796,16 +847,11 @@ def _datas_esperadas(tipo: str, datas: List[str]) -> Set[str]:
 
 def coordenada_completa(datas: List[str], lat: float, lon: float,
                         existentes: Dict) -> bool:
-    """
-    Indica se a coordenada já possui todas as datas do período
-    (PERIODO_DOWNLOAD) para todos os tipos de dados baixados.
-    """
     chave = (float(lat), float(lon))
     for tipo in ("diario", "horario", "qualidade_ar", "polen"):
         esperadas = _datas_esperadas(tipo, datas)
         presentes = existentes[tipo].get(chave, set())
-        if not esperadas.issubset(presentes):
-            return False
+        if not esperadas.issubset(presentes): return False
     return True
 
 def main() -> None:
@@ -819,7 +865,8 @@ def main() -> None:
     print(f"Período: {datas[0]} a {datas[-1]}")
     print(f"Total de datas: {len(datas)}")
     print(f"Total de localizações: {len(COORDENADAS)}")
-    print(f"Threads: {MAX_WORKERS} | Dias por requisição: {CHUNK_DIAS}")
+    print(f"Threads download: {DOWNLOAD_WORKERS} | Threads processamento: {PROCESS_WORKERS}")
+    print(f"Dias por requisição: {CHUNK_DIAS}")
     print(f"Rate-limit: {REQUESTS_PER_SECOND} req/s | Timeout: {HTTP_TIMEOUT}s")
     print(f"Retries máximos: {MAX_RETRIES}")
     print("=" * 60)
@@ -831,19 +878,15 @@ def main() -> None:
     existentes = carregar_existentes(datas, COORDENADAS)
     tempo_carregamento = time.time() - inicio_carregamento
 
-    totais = {tipo: sum(len(v) for v in existentes[tipo].values())
-              for tipo in existentes}
+    totais = {tipo: sum(len(v) for v in existentes[tipo].values()) for tipo in existentes}
     print(f"[DB] Carregado em {tempo_carregamento:.2f}s")
-    print(f"[DB] Existentes -> diário: {totais['diario']}, horário: {totais['horario']}, "
-          f"qualidade_ar: {totais['qualidade_ar']}, polen: {totais['polen']}")
+    print(f"[DB] Existentes -> diário: {totais['diario']}, horário: {totais['horario']}, " f"qualidade_ar: {totais['qualidade_ar']}, polen: {totais['polen']}")
 
     # Pula coordenadas que já possuem todas as datas do período
     coordenadas_ativas = []
     for lat, lon in COORDENADAS:
-        if coordenada_completa(datas, lat, lon, existentes):
-            print(f"[DB] Coordenada ({lat}, {lon}) já possui todas as datas do período. Pulando...")
-        else:
-            coordenadas_ativas.append((lat, lon))
+        if coordenada_completa(datas, lat, lon, existentes): print(f"[DB] Coordenada ({lat}, {lon}) já possui todas as datas do período. Pulando...")
+        else: coordenadas_ativas.append((lat, lon))
 
     coordenadas_puladas = len(COORDENADAS) - len(coordenadas_ativas)
     if not coordenadas_ativas:
@@ -851,38 +894,73 @@ def main() -> None:
         return
 
     # Cria tarefas
-    tarefas = [(datas[i:i + CHUNK_DIAS], lat, lon)
-               for lat, lon in coordenadas_ativas
-               for i in range(0, len(datas), CHUNK_DIAS)]
+    tarefas = [(datas[i:i + CHUNK_DIAS], lat, lon) for lat, lon in coordenadas_ativas for i in range(0, len(datas), CHUNK_DIAS)]
 
     stats = {
-        "baixado_diario": 0, "baixado_horario": 0,
-        "baixado_ar": 0, "baixado_polen": 0,
-        "pulado_diario": 0, "pulado_horario": 0,
-        "pulado_ar": 0, "pulado_polen": 0,
+        "baixado_diario": 0,
+        "baixado_horario": 0,
+        "baixado_ar": 0,
+        "baixado_polen": 0,
+        "pulado_diario": 0,
+        "pulado_horario": 0,
+        "pulado_ar": 0,
+        "pulado_polen": 0,
     }
     stats_lock = threading.Lock()
     concluidos = 0
     total = len(tarefas)
     inicio = time.time()
 
-    def executar(tarefa):
-        nonlocal concluidos
+    # Fila para transferir resultados de download -> processamento
+    fila_resultados: Queue = Queue(maxsize=DOWNLOAD_WORKERS * 2)
+
+    # Contador de produtores terminados (thread-safe)
+    produtores_terminados = [0]
+    produtores_lock = threading.Lock()
+
+    def produtor(tarefa):
         datas_bloco, lat, lon = tarefa
-        processar_bloco(datas_bloco, lat, lon, existentes, stats)
-        with stats_lock:
-            concluidos += 1
-            if concluidos % 5 == 0 or concluidos == total:
-                pct = concluidos / total * 100
-                decorrido = time.time() - inicio
-                print(f"\r[PROGRESSO] {concluidos}/{total} blocos ({pct:.1f}%) - {decorrido:.0f}s",
-                      end="", flush=True)
+        resultado = baixar_bloco(datas_bloco, lat, lon, existentes)
+        if resultado: fila_resultados.put(resultado)
 
-    print(f"\nIniciando {total} tarefas com {MAX_WORKERS} threads...\n")
+    def consumidor():
+        nonlocal concluidos
+        while True:
+            try:
+                resultado = fila_resultados.get(timeout=1)
+            except Empty:
+                # Se todos os produtores terminaram e a fila está vazia, sair
+                with produtores_lock: todos_terminados = produtores_terminados[0] >= total
+                if todos_terminados and fila_resultados.empty(): break
+                continue
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(executar, t) for t in tarefas]
-        for future in as_completed(futures): future.result()
+            processar_resultado(resultado, existentes, stats)
+            with stats_lock:
+                concluidos += 1
+                if concluidos % 5 == 0 or concluidos == total:
+                    pct = concluidos / total * 100
+                    decorrido = time.time() - inicio
+                    print(f"\r[PROGRESSO] {concluidos}/{total} blocos ({pct:.1f}%) - {decorrido:.0f}s", end="", flush=True)
+
+    def produtor_wrapper(tarefa):
+        try:
+            produtor(tarefa)
+        finally:
+            with produtores_lock: produtores_terminados[0] += 1
+
+    print(f"\nIniciando {total} tarefas: {DOWNLOAD_WORKERS} threads de download, " f"{PROCESS_WORKERS} threads de processamento...\n")
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor_download:
+        with ThreadPoolExecutor(max_workers=PROCESS_WORKERS) as executor_process:
+            # Inicia consumidores
+            futures_process = [executor_process.submit(consumidor) for _ in range(PROCESS_WORKERS)]
+
+            # Envia tarefas de download
+            futures_download = [executor_download.submit(produtor_wrapper, t) for t in tarefas]
+            # Espera que todos os downloads terminem
+            for future in as_completed(futures_download): future.result()
+            # Espera que os consumidores terminem
+            for future in futures_process: future.result()
 
     print()
     print("\n" + "=" * 60)

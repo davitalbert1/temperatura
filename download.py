@@ -13,7 +13,7 @@ from urllib3.util.retry import Retry
 
 DB_PATH = "clima.db"
 MAX_SQL_DATES_POR_LOTE = 900
-DOWNLOAD_WORKERS = int(os.environ.get("OPENMETEO_DOWNLOAD_WORKERS", "5"))
+DOWNLOAD_WORKERS = int(os.environ.get("OPENMETEO_DOWNLOAD_WORKERS", "10"))
 PROCESS_WORKERS = int(os.environ.get("OPENMETEO_PROCESS_WORKERS", "2"))
 CHUNK_DIAS = int(os.environ.get("OPENMETEO_CHUNK_DIAS", "30"))
 REQUESTS_PER_SECOND = float(os.environ.get("OPENMETEO_RPS", "4"))
@@ -52,14 +52,10 @@ FUSO_HORARIO = "America/Sao_Paulo"
 PERIODO_DOWNLOAD = ["1940-01-01", "2025-12-31"]
 
 # URLs das APIs
-# - Histórico disponível: aproximadamente os últimos 92 dias.
-URL_FORECAST = "https://api.open-meteo.com/v1/forecast"
-# - Com ERA5, permite dados desde 1940.
-URL_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
-# - Permite consultar dados passados recentes através de past_days.
-URL_AIR_QUALITY = "https://air-quality-api.open-meteo.com/v1/air-quality"
-# - Não funciona como um arquivo histórico meteorológico de longo prazo.
-URL_POLLEN = "https://api.open-meteo.com/v1/pollen"
+URL_FORECAST = "https://api.open-meteo.com/v1/forecast" # disponível: ~92 dias.
+URL_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive" # Com ERA5: desde 1940.
+URL_AIR_QUALITY = "https://air-quality-api.open-meteo.com/v1/air-quality" # dados recentes com past_days.
+URL_POLLEN = "https://api.open-meteo.com/v1/pollen" # - Sem histórico de longo prazo.
 
 DAILY_PARAMS = [
     "weathercode",
@@ -176,7 +172,7 @@ def _esperar_rate_limit() -> None:
         time.sleep(espera)
 
 def _reduzir_taxa_429() -> None:
-    global _rps_atual, _429_consecutivos, _cooldown_ate
+    global _rps_atual, _429_consecutivos, _cooldown_ate, _tokens
     with _rate_lock:
         _429_consecutivos += 1
         _rps_atual = max(MIN_RPS, _rps_atual * 0.5)

@@ -3,3 +3,4 @@ __pycache__
 TODO.md
 clima.db-shm
 clima.db-wal
+*.txt

@@ -13,7 +13,7 @@ from urllib3.util.retry import Retry
 
 DB_PATH = "clima.db"
 MAX_SQL_DATES_POR_LOTE = 900
-DOWNLOAD_WORKERS = int(os.environ.get("OPENMETEO_DOWNLOAD_WORKERS", "10"))
+DOWNLOAD_WORKERS = int(os.environ.get("OPENMETEO_DOWNLOAD_WORKERS", "5"))
 PROCESS_WORKERS = int(os.environ.get("OPENMETEO_PROCESS_WORKERS", "2"))
 CHUNK_DIAS = int(os.environ.get("OPENMETEO_CHUNK_DIAS", "30"))
 REQUESTS_PER_SECOND = float(os.environ.get("OPENMETEO_RPS", "4"))
@@ -380,6 +380,9 @@ def init_database() -> None:
         ("polen", "latitude, longitude, data"),
     ]:
         cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{tabela}_loc ON {tabela}({coluna})")
+    # Índices por data: aceleram a carga de registros existentes (filtro por intervalo de datas)
+    for tabela in ["clima_diario", "clima_horario", "qualidade_ar", "polen"]:
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{tabela}_data ON {tabela}(data)")
 
     conn.commit()
     log("[DB] Banco inicializado.")
@@ -396,6 +399,9 @@ def carregar_existentes(datas: List[str], coordenadas: List) -> Dict[str, Dict]:
         "polen": "polen",
     }
 
+    # Conjunto de coordenadas de interesse (como floats, para casar com a chave usada no resto do código)
+    coords_alvo = {(float(lat), float(lon)) for lat, lon in coordenadas}
+
     for tipo, tabela in tabelas.items():
         # Filtra datas por tipo
         if tipo == "qualidade_ar":
@@ -408,17 +414,20 @@ def carregar_existentes(datas: List[str], coordenadas: List) -> Dict[str, Dict]:
 
         if not datas_filtradas: continue
 
-        # Carrega em lotes por coordenada
-        for lat, lon in coordenadas:
-            chave = (float(lat), float(lon))
-            if chave not in existentes[tipo]: existentes[tipo][chave] = set()
+        datas_set = set(datas_filtradas)
+        mapa = existentes[tipo]
+        for lat, lon in coords_alvo: mapa[(lat, lon)] = set()
 
-            for i in range(0, len(datas_filtradas), MAX_SQL_DATES_POR_LOTE):
-                lote = datas_filtradas[i:i + MAX_SQL_DATES_POR_LOTE]
-                placeholders = ",".join(["?"] * len(lote))
-                query = f"SELECT data FROM {tabela} WHERE latitude=? AND longitude=? AND data IN ({placeholders})"
-                cursor.execute(query, [lat, lon] + lote)
-                existentes[tipo][chave].update(row[0] for row in cursor.fetchall())
+        # 1 única consulta por tabela: apenas data, latitude e longitude no intervalo do período
+        cursor.execute(
+            f"SELECT latitude, longitude, data FROM {tabela} WHERE data BETWEEN ? AND ?",
+            (datas_filtradas[0], datas_filtradas[-1]),
+        )
+        for lat, lon, data in cursor:
+            if data not in datas_set: continue
+            chave = (float(lat), float(lon))
+            if chave not in coords_alvo: continue
+            mapa[chave].add(data)
 
     return existentes
 
@@ -877,20 +886,39 @@ def main() -> None:
     totais = {tipo: sum(len(v) for v in existentes[tipo].values()) for tipo in existentes}
     print(f"[DB] Carregado em {tempo_carregamento:.2f}s")
     print(f"[DB] Existentes -> diário: {totais['diario']}, horário: {totais['horario']}, " f"qualidade_ar: {totais['qualidade_ar']}, polen: {totais['polen']}")
+    print(f"[DB] Total de itens (data x coordenada) faltantes para processamento: {total_faltantes}")
 
-    # Pula coordenadas que já possuem todas as datas do período
+    # Pula coordenadas que já possuem todas as datas do período e monta tarefas
+    # somente com as datas que NÃO existem (faltantes) para cada coordenada
     coordenadas_ativas = []
+    total_faltantes = 0
     for lat, lon in COORDENADAS:
-        if coordenada_completa(datas, lat, lon, existentes): print(f"[DB] Coordenada ({lat}, {lon}) já possui todas as datas do período. Pulando...")
-        else: coordenadas_ativas.append((lat, lon))
+        if coordenada_completa(datas, lat, lon, existentes):
+            print(f"[DB] Coordenada ({lat}, {lon}) já possui todas as datas do período. Pulando...")
+            continue
+        # Apenas datas com pelo menos um tipo de dado faltante entram para processamento
+        datas_faltantes = [
+            d for d in datas
+            if d not in existentes["diario"].get((float(lat), float(lon)), set())
+            or d not in existentes["horario"].get((float(lat), float(lon)), set())
+            or (d >= DATA_MINIMA_QUALIDADE_AR and d not in existentes["qualidade_ar"].get((float(lat), float(lon)), set()))
+            or (datetime.strptime(d, "%Y-%m-%d").date() >= datetime.now().date()
+                and d not in existentes["polen"].get((float(lat), float(lon)), set()))
+        ]
+        if datas_faltantes:
+            coordenadas_ativas.append((datas_faltantes, lat, lon))
+            total_faltantes += len(datas_faltantes)
 
     coordenadas_puladas = len(COORDENADAS) - len(coordenadas_ativas)
     if not coordenadas_ativas:
         print("[DB] Nenhuma coordenada com dados pendentes. Nada a fazer.")
         return
 
-    # Cria tarefas
-    tarefas = [(datas[i:i + CHUNK_DIAS], lat, lon) for lat, lon in coordenadas_ativas for i in range(0, len(datas), CHUNK_DIAS)]
+    # Cria tarefas (cada coordenada só recebe os blocos com datas faltantes)
+    tarefas = []
+    for datas_coord, lat, lon in coordenadas_ativas:
+        for i in range(0, len(datas_coord), CHUNK_DIAS):
+            tarefas.append((datas_coord[i:i + CHUNK_DIAS], lat, lon))
 
     stats = {
         "baixado_diario": 0,

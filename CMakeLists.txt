@@ -20,12 +20,7 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Sql)
 
 add_executable(clima_viewer WIN32 app/main.cpp)
 set_target_properties(clima_viewer PROPERTIES AUTOMOC ON)
-target_link_libraries(clima_viewer PRIVATE
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Widgets
-    Qt6::Sql
-)
+target_link_libraries(clima_viewer PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Sql)
 
 # download.exe - download de dados climaticos (download.cpp)
 find_package(CURL REQUIRED)
@@ -33,11 +28,7 @@ find_package(SQLite3 REQUIRED)
 find_package(Threads REQUIRED)
 
 add_executable(download download.cpp)
-target_link_libraries(download PRIVATE
-    CURL::libcurl
-    SQLite3::SQLite3
-    Threads::Threads
-)
+target_link_libraries(download PRIVATE CURL::libcurl SQLite3::SQLite3 Threads::Threads)
 
 # nlohmann/json (header-only): usa o pacote CMake se existir,
 # senão procura o include padrão nlohmann/json.hpp

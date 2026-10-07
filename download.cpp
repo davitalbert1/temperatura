@@ -1564,7 +1564,7 @@ static bool coordenada_completa(const std::vector<std::string>& datas, double la
     for (const char* tipo : {"diario", "horario", "qualidade_ar", "polen"}) {
         auto esperadas = datas_esperadas(tipo, datas);
         const auto& p = presentes(existentes, tipo, chave);
-        for (const auto& d : esperadas){
+        for (const auto& d : esperadas) {
             if (!p.count(d)) return false;
         }
     }
@@ -1651,9 +1651,7 @@ int main(int argc, char** argv) {
         auto inicio_carregamento = std::chrono::steady_clock::now();
         Existentes existentes = carregar_existentes(datas, CFG.coordenadas);
         double tempo_carregamento =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                          inicio_carregamento)
-                .count();
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - inicio_carregamento).count();
 
         const std::map<std::string, size_t> ordem = {
             {"diario", 0}, {"horario", 1}, {"qualidade_ar", 2}, {"polen", 3}};
@@ -1720,8 +1718,7 @@ int main(int argc, char** argv) {
             }
             if (!datas_faltantes.empty()) {
                 total_faltantes += static_cast<long long>(datas_faltantes.size());
-                coordenadas_ativas.emplace_back(std::move(datas_faltantes),
-                                                std::make_pair(lat, lon));
+                coordenadas_ativas.emplace_back(std::move(datas_faltantes), std::make_pair(lat, lon));
             }
         }
 
@@ -1816,8 +1813,7 @@ int main(int argc, char** argv) {
         for (auto& t : produtores) t.join();
         for (auto& t : consumidores) t.join();
 
-        double tempo_total =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - inicio).count();
+        double tempo_total = std::chrono::duration<double>(std::chrono::steady_clock::now() - inicio).count();
         std::cout << "\n\n============================================================\n"
                   << "DOWNLOAD CONCLUIDO!\n"
                   << "============================================================\n"

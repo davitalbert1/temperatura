@@ -8,8 +8,8 @@ def contar_registros():
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT name 
-        FROM sqlite_master 
+        SELECT name
+        FROM sqlite_master
         WHERE type='table'
     """)
 
@@ -32,7 +32,7 @@ def periodo_dados(tabela, coluna_data):
     cursor = conn.cursor()
 
     cursor.execute(f"""
-        SELECT 
+        SELECT
             MIN({coluna_data}),
             MAX({coluna_data}),
             COUNT(*)
@@ -48,13 +48,10 @@ def periodo_dados(tabela, coluna_data):
         print("Sem dados")
         return
 
-    print(f"Início : {inicio}")
-    print(f"Fim    : {fim}")
-    print(f"Total  : {total}")
+    print(f"Início: {inicio}")
+    print(f"Fim: {fim}")
+    print(f"Total: {total}")
 
-# ==============================
-# LISTAR TABELAS
-# ==============================
 def listar_tabelas():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -68,13 +65,8 @@ def listar_tabelas():
     conn.close()
 
     print("\n=== TABELAS NO BANCO ===")
-    for t in tabelas:
-        print(t[0])
+    for t in tabelas: print(t[0])
 
-
-# ==============================
-# MOSTRAR ESTRUTURA
-# ==============================
 def estrutura_tabela(nome_tabela):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -86,13 +78,8 @@ def estrutura_tabela(nome_tabela):
 
     print(f"\n=== ESTRUTURA: {nome_tabela} ===")
     print("cid | nome | tipo | notnull | default | pk")
-    for c in colunas:
-        print(c)
+    for c in colunas: print(c)
 
-
-# ==============================
-# MOSTRAR ÍNDICES
-# ==============================
 def mostrar_indices(nome_tabela):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -103,19 +90,14 @@ def mostrar_indices(nome_tabela):
     conn.close()
 
     print(f"\n=== ÍNDICES: {nome_tabela} ===")
-    for i in indices:
-        print(i)
+    for i in indices: print(i)
 
-
-# ==============================
-# ÚLTIMOS REGISTROS HOURLY
-# ==============================
 def ultimos_hourly(limite=5):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
     cursor.execute(f"""
-        SELECT 
+        SELECT
             local,
             data_hora,
             temperatura,
@@ -131,19 +113,14 @@ def ultimos_hourly(limite=5):
     conn.close()
 
     print("\n=== ÚLTIMOS HOURLY ===")
-    for r in rows:
-        print(r)
+    for r in rows: print(r)
 
-
-# ==============================
-# ÚLTIMOS REGISTROS DAILY
-# ==============================
 def ultimos_daily(limite=5):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
     cursor.execute(f"""
-        SELECT 
+        SELECT
             local,
             data,
             nascer_sol,
@@ -165,7 +142,7 @@ def verificar_gaps():
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT data_hora 
+        SELECT data_hora
         FROM clima_hourly
         ORDER BY data_hora
     """)
@@ -177,13 +154,8 @@ def verificar_gaps():
 
     for i in range(1, len(datas)):
         esperado = datas[i-1] + timedelta(hours=1)
+        if datas[i] != esperado: print(f"GAP REAL: {datas[i-1]} → {datas[i]}")
 
-        if datas[i] != esperado:
-            print(f"GAP REAL: {datas[i-1]} → {datas[i]}")
-
-# ==============================
-# MAIN
-# ==============================
 def main():
     listar_tabelas()
 
@@ -202,7 +174,6 @@ def main():
     # últimos registros
     ultimos_hourly()
     ultimos_daily()
-
 
 if __name__ == "__main__":
     main()

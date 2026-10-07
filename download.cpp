@@ -1,24 +1,6 @@
-/*
- * download.cpp - Porta C++ de download.py
- *
- * Download de dados climaticos (Open-Meteo) para SQLite, com rate-limit
- * adaptativo (token bucket), retry com backoff exponencial, circuit breaker
- * para HTTP 429 e pipeline de threads produtoras -> fila -> consumidoras.
- *
- * Compilacao (MSYS2/MinGW64):
- *   g++ -std=c++17 -O2 -Wall download.cpp -o download.exe -lcurl -lsqlite3
- *   (ou use compilar_download.bat)
- *
- * Execucao:
- *   download.exe [caminho_do_ini]   (padrao: download.ini)
- *
- * Bibliotecas: libcurl (HTTP), nlohmann/json (JSON), sqlite3 (banco).
- */
-
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <sqlite3.h>
-
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -456,7 +438,10 @@ static std::mutex g_rate_mtx;
 static double g_tokens = 0.0;
 static double g_rps_atual = 0.0;
 static std::chrono::steady_clock::time_point g_ultimo_refil;
-static std::chrono::steady_clock::time_point g_cooldown_ate;
+// Cooldown absoluto baseado em epoch (evita erro de acumulacao de delta)
+static std::chrono::steady_clock::time_point g_cooldown_inicio;
+static double g_cooldown_atual = 0.0;
+static int g_cooldown_ativo = 0;
 static int g_429_consecutivos = 0;
 
 static void iniciar_rate_limit() {
@@ -464,7 +449,9 @@ static void iniciar_rate_limit() {
     g_tokens = CFG.requests_per_second;
     g_rps_atual = CFG.requests_per_second;
     g_ultimo_refil = std::chrono::steady_clock::now();
-    g_cooldown_ate = std::chrono::steady_clock::time_point{};
+    g_cooldown_inicio = std::chrono::steady_clock::now();
+    g_cooldown_atual = 0.0;
+    g_cooldown_ativo = 0;
     g_429_consecutivos = 0;
 }
 
@@ -485,8 +472,15 @@ static void dormir(double segundos) {
 // Deve ser chamada com g_rate_mtx segurado
 static double proxima_espera() {
     auto agora = std::chrono::steady_clock::now();
-    if (agora < g_cooldown_ate)
-        return std::chrono::duration<double>(g_cooldown_ate - agora).count();
+    if (g_cooldown_ativo) {
+        // Cooldown absoluto baseado em epoch (nao em acumulacao de delta)
+        double restante = g_cooldown_atual -
+                          std::chrono::duration<double>(agora - g_cooldown_inicio).count();
+        if (restante > 0) return restante;
+        // Cooldown expirado: limpa flag e continua
+        g_cooldown_ativo = 0;
+        g_cooldown_atual = 0.0;
+    }
 
     double desde = std::chrono::duration<double>(agora - g_ultimo_refil).count();
     g_tokens = std::min(g_rps_atual, g_tokens + desde * g_rps_atual);
@@ -511,17 +505,19 @@ static void esperar_rate_limit() {
 static void reduzir_taxa_429() {
     std::lock_guard<std::mutex> lk(g_rate_mtx);
     g_429_consecutivos++;
+    // Reduz a taxa pela metade a cada 429, respeitando o piso min_rps
     g_rps_atual = std::max(CFG.min_rps, g_rps_atual * 0.5);
     g_tokens = std::min(g_tokens, g_rps_atual);
     if (g_429_consecutivos >= CFG.circuit_limit_429) {
-        g_cooldown_ate = std::chrono::steady_clock::now() +
-                         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                             std::chrono::duration<double>(CFG.cooldown_429));
-        char buf[160];
+        // Cooldown absoluto baseado em epoch para evitar deriva de delta
+        g_cooldown_inicio = std::chrono::steady_clock::now();
+        g_cooldown_atual = CFG.cooldown_429;
+        g_cooldown_ativo = 1;
+        char buf[200];
         std::snprintf(buf, sizeof(buf),
-                      "  [429] Muitas respostas 429. Pausa global de %.0fs "
+                      "  [429] Circuit breaker ativado. Pausa global de %.0fs "
                       "(taxa: %.2f req/s)",
-                      CFG.cooldown_429, g_rps_atual);
+                      g_cooldown_atual, g_rps_atual);
         log(buf);
         g_429_consecutivos = 0;
     }
@@ -530,15 +526,24 @@ static void reduzir_taxa_429() {
 static void restaurar_taxa() {
     std::lock_guard<std::mutex> lk(g_rate_mtx);
     g_429_consecutivos = 0;
+    g_cooldown_ativo = 0;
+    // Retoma gradualmente a taxa a cada sucesso (evita picos apos 429)
     if (g_rps_atual < CFG.requests_per_second)
-        g_rps_atual = std::min(CFG.requests_per_second, g_rps_atual * 1.1);
+        g_rps_atual = std::min(CFG.requests_per_second, g_rps_atual * 1.2);
+    g_tokens = std::min(g_tokens, g_rps_atual);
 }
 
 static void esperar_cooldown_global() {
     double espera;
     {
         std::lock_guard<std::mutex> lk(g_rate_mtx);
-        espera = std::chrono::duration<double>(g_cooldown_ate - std::chrono::steady_clock::now()).count();
+        // Cooldown absoluto baseado em epoch (evita erro de acumulacao de delta)
+        if (g_cooldown_ativo) {
+            espera = g_cooldown_atual - std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - g_cooldown_inicio).count();
+        } else {
+            espera = 0.0;
+        }
     }
     if (espera > 0) {
         char buf[128];
@@ -737,6 +742,16 @@ struct Existentes {
     std::map<std::string, std::map<Chave, ConjuntoDatas>> dados;
 };
 
+// Cache LRU para consultas de coordenadas existentes
+// Evita re-scan do banco em reinicios/repeticoes proximas no tempo
+struct EntradaCacheCoords {
+    std::string fingerprint;
+    Existentes dados;
+};
+
+static std::mutex g_cache_mtx;
+static std::optional<EntradaCacheCoords> g_cache_coords;
+
 // Produtores fazem leitura compartilhada; consumidores fazem escrita exclusiva
 static std::shared_mutex g_mtx_existentes;
 
@@ -744,6 +759,14 @@ static const ConjuntoDatas& datas_vazias() {
     static const ConjuntoDatas vazio;
     return vazio;
 }
+
+// Forward decls: verificação agrupada de coordenadas (otimização de busca no banco)
+static std::string fingerprint_coords(const std::vector<std::string>& datas,
+                                      const std::vector<std::pair<double, double>>& coordenadas);
+static void existe_alguns_registros(const Existentes& existentes,
+                                    const std::vector<std::string>& tipos_registro,
+                                    const Chave& chave,
+                                    std::map<std::string, bool>& ja_tem);
 
 static const ConjuntoDatas& presentes(const Existentes& e, const std::string& tipo,
                                       const Chave& chave) {
@@ -783,10 +806,53 @@ static ConjuntoDatas datas_esperadas(const std::string& tipo,
     return out;
 }
 
+// Fingerprint estavel p/ reutilizar o scan do banco dentro do processo
+static std::string fingerprint_coords(const std::vector<std::string>& datas,
+                                      const std::vector<std::pair<double, double>>& coordenadas) {
+    std::ostringstream oss;
+    oss << "n=" << datas.size() << "|";
+    if (!datas.empty()) oss << datas.front() << ">" << datas.back() << "|";
+    oss << CFG.data_minima_qualidade_ar << "|";
+    std::set<Chave> ordenadas(coordenadas.begin(), coordenadas.end());
+    oss << "c=" << ordenadas.size() << "|";
+    for (const auto& c : ordenadas) oss << num_str(c.first) << "," << num_str(c.second) << ";";
+    return oss.str();
+}
+
+// Busca agrupada: uma passada por coordenada informa quais tipos ja tem algum registro
+// (evita N*T lookups no loop principal de montagem de tarefas)
+static void existe_alguns_registros(const Existentes& existentes,
+                                    const std::vector<std::string>& tipos_registro,
+                                    const Chave& chave,
+                                    std::map<std::string, bool>& ja_tem) {
+    for (const auto& t : tipos_registro) {
+        auto it = existentes.dados.find(t);
+        bool tem = (it != existentes.dados.end()) &&
+                   it->second.find(chave) != it->second.end() &&
+                   !it->second.at(chave).empty();
+        ja_tem[t] = tem;
+    }
+}
+
 static Existentes carregar_existentes(const std::vector<std::string>& datas,
                                       const std::vector<std::pair<double, double>>& coordenadas) {
     sqlite3* conn = get_connection();
+
+    // Cache em processo: se datas+coordenadas nao mudaram, reutiliza o scan anterior
+    std::string fp = fingerprint_coords(datas, coordenadas);
+    {
+        std::lock_guard<std::mutex> lk(g_cache_mtx);
+        if (g_cache_coords && g_cache_coords->fingerprint == fp) {
+            log("[DB] Reutilizando registros existentes do cache (sem re-scan).");
+            return g_cache_coords->dados;
+        }
+    }
     Existentes existentes;
+    auto guardar_cache = [&]() {
+        std::lock_guard<std::mutex> lk(g_cache_mtx);
+        g_cache_coords = EntradaCacheCoords{fp, existentes};
+    };
+
     const std::map<std::string, std::string> tabelas = {
         {"diario", "clima_diario"},
         {"horario", "clima_horario"},
@@ -842,6 +908,7 @@ static Existentes carregar_existentes(const std::vector<std::string>& datas,
         }
         sqlite3_finalize(stmt);
     }
+    guardar_cache();
     return existentes;
 }
 
@@ -1021,8 +1088,9 @@ static size_t escrever_corpo(char* ptr, size_t tam, size_t nmemb, void* ud) {
 static size_t ler_header(char* buffer, size_t tam, size_t n, void* ud) {
     std::string linha(buffer, tam * n);
     std::string baixo = linha;
-    std::transform(baixo.begin(), baixo.end(), baixo.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(baixo.begin(), baixo.end(), baixo.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
     if (baixo.rfind("retry-after:", 0) == 0) {
         std::string valor = cortar(linha.substr(12));
         try {
@@ -1067,8 +1135,7 @@ static RespostaHttp http_get(const std::string& url) {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.corpo);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ler_header);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA, &r);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
-                     static_cast<long>(CFG.http_timeout * 1000.0));
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(CFG.http_timeout * 1000.0));
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -1120,9 +1187,24 @@ static std::optional<json> baixar_com_retry(const std::string& url,
 
         if (!r.erro_rede && r.status == 429) {
             reduzir_taxa_429();
-            double espera =
-                std::max(CFG.espera_min_429,
-                         r.retry_after > 0 ? r.retry_after : backoff_exponencial(tentativa));
+
+            // Prioridade: Retry-After do servidor > backoff > espera minima
+            double espera = CFG.espera_min_429;
+            if (r.retry_after > 0) {
+                espera = r.retry_after;
+            } else {
+                espera = backoff_exponencial(tentativa);
+            }
+
+            // Se o cooldown global ja esta ativo, espera o cooldown (nao espera dobrado)
+            {
+                std::lock_guard<std::mutex> lk(g_rate_mtx);
+                if (g_cooldown_ativo) {
+                    double restante = g_cooldown_atual - std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - g_cooldown_inicio).count();
+                    if (restante > espera) espera = restante;
+                }
+            }
             if (tentativa == max_tentativas) {
                 log("  [ERRO] 429 persistente apos " + std::to_string(max_tentativas) +
                     " tentativas");
@@ -1497,7 +1579,9 @@ public:
 
     void put(T&& valor) {
         std::unique_lock<std::mutex> lk(m_);
-        cv_cheia_.wait(lk, [&] { return q_.size() < cap_; });
+        cv_cheia_.wait(lk, [&] {
+            return q_.size() < cap_;
+        });
         q_.push(std::move(valor));
         cv_vazia_.notify_one();
     }
@@ -1505,7 +1589,9 @@ public:
     // Retorna false quando a fila foi fechada e esvaziada
     bool get(T& saida) {
         std::unique_lock<std::mutex> lk(m_);
-        cv_vazia_.wait(lk, [&] { return !q_.empty() || fechada_; });
+        cv_vazia_.wait(lk, [&] {
+            return !q_.empty() || fechada_;
+        });
         if (q_.empty()) return false;
         saida = std::move(q_.front());
         q_.pop();
@@ -1588,21 +1674,47 @@ int main(int argc, char** argv) {
             coordenadas_ativas;
         long long total_faltantes = 0;
         for (const auto& [lat, lon] : CFG.coordenadas) {
+            // Verificacao agrupada: uma passada informa quais tipos tem dados (O(T)).
+            // Tipos vazios dispensam N lookups de data no loop abaixo.
+            Chave chave{lat, lon};
+            std::map<std::string, bool> tem = {{"diario", false},
+                                               {"horario", false},
+                                               {"qualidade_ar", false},
+                                               {"polen", false}};
+            {
+                std::shared_lock lk(g_mtx_existentes);
+                static const std::vector<std::string> ordens = {
+                    "diario", "horario", "qualidade_ar", "polen"};
+                existe_alguns_registros(existentes, ordens, chave, tem);
+            }
+            if (!tem["diario"] && !tem["horario"] &&
+                !tem["qualidade_ar"] && !tem["polen"]) {
+                // Nenhum registro: tudo falta, entra direto sem varrer 'datas'
+                coordenadas_ativas.emplace_back(datas, std::make_pair(lat, lon));
+                total_faltantes += static_cast<long long>(datas.size());
+                continue;
+            }
             if (coordenada_completa(datas, lat, lon, existentes)) {
                 std::cout << "[DB] Coordenada (" << lat << ", " << lon
                           << ") ja possui todas as datas do periodo. Pulando...\n";
                 continue;
             }
-            Chave chave{lat, lon};
+            std::string h = hoje();
             std::vector<std::string> datas_faltantes;
             {
                 std::shared_lock lk(g_mtx_existentes);
+                // Referencias capturadas uma vez: evita 4 map-lookups por data
+                const ConjuntoDatas& p_diario = presentes(existentes, "diario", chave);
+                const ConjuntoDatas& p_horario = presentes(existentes, "horario", chave);
+                const ConjuntoDatas& p_ar = presentes(existentes, "qualidade_ar", chave);
+                const ConjuntoDatas& p_polen = presentes(existentes, "polen", chave);
                 for (const auto& d : datas) {
                     bool falta = false;
-                    if (!presentes(existentes, "diario", chave).count(d)) falta = true;
-                    else if (!presentes(existentes, "horario", chave).count(d)) falta = true;
-                    else if (d >= CFG.data_minima_qualidade_ar && !presentes(existentes, "qualidade_ar", chave).count(d)) falta = true;
-                    else if (d >= hoje() && !presentes(existentes, "polen", chave).count(d)) falta = true;
+                    if (tem["diario"] ? !p_diario.count(d) : true) falta = true;
+                    else if (tem["horario"] ? !p_horario.count(d) : true) falta = true;
+                    else if (d >= CFG.data_minima_qualidade_ar &&
+                             (tem["qualidade_ar"] ? !p_ar.count(d) : true)) falta = true;
+                    else if (d >= h && (tem["polen"] ? !p_polen.count(d) : true)) falta = true;
                     if (falta) datas_faltantes.push_back(d);
                 }
             }

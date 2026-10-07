@@ -4,3 +4,5 @@ TODO.md
 clima.db-shm
 clima.db-wal
 *.txt
+!CMakeLists.txt
+build/

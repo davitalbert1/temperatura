@@ -7,11 +7,7 @@ def contar_registros():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    cursor.execute("""
-        SELECT name
-        FROM sqlite_master
-        WHERE type='table'
-    """)
+    cursor.execute("""SELECT name FROM sqlite_master WHERE type='table'""")
 
     tabelas = cursor.fetchall()
 
@@ -32,12 +28,7 @@ def periodo_dados(tabela, coluna_data):
     cursor = conn.cursor()
 
     cursor.execute(f"""
-        SELECT
-            MIN({coluna_data}),
-            MAX({coluna_data}),
-            COUNT(*)
-        FROM {tabela}
-    """)
+        SELECT MIN({coluna_data}), MAX({coluna_data}), COUNT(*) FROM {tabela}""")
 
     inicio, fim, total = cursor.fetchone()
     conn.close()
@@ -56,10 +47,7 @@ def listar_tabelas():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    cursor.execute("""
-        SELECT name FROM sqlite_master
-        WHERE type='table'
-    """)
+    cursor.execute("""SELECT name FROM sqlite_master WHERE type='table'""")
 
     tabelas = cursor.fetchall()
     conn.close()
@@ -97,13 +85,7 @@ def ultimos_hourly(limite=5):
     cursor = conn.cursor()
 
     cursor.execute(f"""
-        SELECT
-            local,
-            data_hora,
-            temperatura,
-            umidade,
-            sensacao,
-            precipitacao
+        SELECT local, data_hora, temperatura, umidade, sensacao, precipitacao
         FROM clima_hourly
         ORDER BY data_hora DESC
         LIMIT {limite}
@@ -120,11 +102,7 @@ def ultimos_daily(limite=5):
     cursor = conn.cursor()
 
     cursor.execute(f"""
-        SELECT
-            local,
-            data,
-            nascer_sol,
-            por_sol
+        SELECT local, data, nascer_sol, por_sol
         FROM clima_daily
         ORDER BY data DESC
         LIMIT {limite}
@@ -134,18 +112,13 @@ def ultimos_daily(limite=5):
     conn.close()
 
     print("\n=== ÚLTIMOS DAILY ===")
-    for r in rows:
-        print(r)
+    for r in rows: print(r)
 
 def verificar_gaps():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    cursor.execute("""
-        SELECT data_hora
-        FROM clima_hourly
-        ORDER BY data_hora
-    """)
+    cursor.execute("""SELECT data_hora FROM clima_hourly ORDER BY data_hora""")
 
     datas = [datetime.fromisoformat(row[0]) for row in cursor.fetchall()]
     conn.close()

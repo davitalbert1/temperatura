@@ -24,7 +24,7 @@ echo.
 for %%I in ("%GXX%") do set "GXX_DIR=%%~dpI"
 set "PATH=%GXX_DIR%;%PATH%"
 
-"%GXX%" -std=c++17 -O2 -Wall -o "%~dp0download.exe" "%~dp0download.cpp" -lcurl -lsqlite3 -pthread
+"%GXX%" -std=c++17 -O2 -Wall -I. -o download.exe download.cpp download/utils.cpp download/config.cpp download/rate_limit.cpp download/storage_sqlite.cpp download/http_client.cpp download/json_parser.cpp download/file_dataset.cpp download/engine_generico.cpp -lcurl -lsqlite3 -pthread
 
 if errorlevel 1 (
     echo.

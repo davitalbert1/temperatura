@@ -22,12 +22,23 @@ add_executable(clima_viewer WIN32 app/main.cpp)
 set_target_properties(clima_viewer PROPERTIES AUTOMOC ON)
 target_link_libraries(clima_viewer PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Sql)
 
-# download.exe - download de dados climaticos (download.cpp)
+# download.exe - download de dados genericos/climaticos
 find_package(CURL REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(Threads REQUIRED)
 
-add_executable(download download.cpp)
+add_executable(download
+    download/main.cpp
+    download/utils.cpp
+    download/config.cpp
+    download/rate_limit.cpp
+    download/storage_sqlite.cpp
+    download/http_client.cpp
+    download/json_parser.cpp
+    download/file_dataset.cpp
+    download/engine_generico.cpp
+)
+target_include_directories(download PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(download PRIVATE CURL::libcurl SQLite3::SQLite3 Threads::Threads)
 
 add_executable(clima_auditor app/test.cpp)

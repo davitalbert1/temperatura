@@ -595,24 +595,23 @@ static void carregar_config(const std::string& caminho) {
     Ini ini = ler_ini(caminho);
     std::string v;
 
-    auto le_texto = [&](const char* sec, const char* chave, std::string& alvo) {
-        // Aceita tanto [geral] (pt) quanto [general] (en).
-        if (ini.obter(sec, chave, v)) alvo = v;
-        if (std::string(sec) == "geral" && ini.obter("general", chave, v)) alvo = v;
-        if (std::string(sec) == "general" && ini.obter("general", chave, v)) alvo = v;
+    // [geral] (pt) e [general] (en); env var sobrescreve o .ini.
+    auto obter_geral = [&](const char* chave) -> bool {
+        return ini.obter("geral", chave, v) || ini.obter("general", chave, v);
+    };
+    auto le_texto = [&](const char* /*sec*/, const char* chave, std::string& alvo) {
+        if (obter_geral(chave)) alvo = v;
     };
     auto le_int = [&](const char* chave, const char* env, int& alvo) {
-        if (ini.obter("general", chave, v)) alvo = para_int(v, alvo);
-        if (ini.obter("general", chave, v)) alvo = para_int(v, alvo);
+        if (obter_geral(chave)) alvo = para_int(v, alvo);
         if (env) alvo = env_int(env, alvo);
     };
     auto le_dbl = [&](const char* chave, const char* env, double& alvo) {
-        if (ini.obter("general", chave, v)) alvo = para_double(v, alvo);
-        if (ini.obter("general", chave, v)) alvo = para_double(v, alvo);
+        if (obter_geral(chave)) alvo = para_double(v, alvo);
         if (env) alvo = env_double(env, alvo);
     };
 
-    le_texto("general", "db_path", CFG.db_path);
+    le_texto("geral", "db_path", CFG.db_path);
     le_int("max_sql_dates_por_lote", nullptr, CFG.max_sql_dates_por_lote);
     le_int("download_workers", "OPENMETEO_DOWNLOAD_WORKERS", CFG.download_workers);
     le_int("process_workers", "OPENMETEO_PROCESS_WORKERS", CFG.process_workers);
@@ -640,7 +639,8 @@ static void carregar_config(const std::string& caminho) {
     le_texto("general", "periodo_inicio", CFG.periodo_inicio);
     le_texto("general", "periodo_fim", CFG.periodo_fim);
 
-    auto coord_linhas = ini.lista("coordinates");
+    auto coord_linhas = ini.lista("coordenadas");
+    if (coord_linhas.empty()) coord_linhas = ini.lista("coordinates");
     if (!coord_linhas.empty()) {
         std::vector<std::pair<double, double>> coords;
         for (const auto& l : coord_linhas) {
@@ -677,6 +677,9 @@ static void carregar_config(const std::string& caminho) {
     if (CFG.min_rps <= 0.0) CFG.min_rps = CFG.requests_per_second * 0.1;
     if (CFG.min_rps > CFG.requests_per_second) CFG.min_rps = CFG.requests_per_second;
     CFG.datasets = montar_datasets_genericos(ini);
+    std::cout << "[CFG] download_workers=" << CFG.download_workers
+              << " process_workers=" << CFG.process_workers
+              << " (fonte: " << caminho << ")\n";
     // db empty in dataset = db norm of [general]; api_keys empty = herda [general]
     for (auto& d : CFG.datasets) {
         if (d.db.empty()) d.db = CFG.db_path;
@@ -687,6 +690,7 @@ static void carregar_config(const std::string& caminho) {
 // Log + utilidades of date
 static std::mutex g_print_mtx;
 static std::mutex g_write_mtx; // serializa gravacoes in database (equivale write_lock)
+static std::mutex g_stats_mtx; // baixados/pulados entre process_workers
 
 static void log(const std::string& msg) {
     std::lock_guard<std::mutex> lk(g_print_mtx);
@@ -1794,7 +1798,11 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
         }
         dias_retornados = static_cast<long long>(dias.size());
     }
-    pulados[r.dataset_idx] += static_cast<long long>(r.datas_pedidas.size()) - dias_retornados;
+    {
+        std::lock_guard<std::mutex> lk(g_stats_mtx);
+        pulados[r.dataset_idx] +=
+            static_cast<long long>(r.datas_pedidas.size()) - dias_retornados;
+    }
     if (r.registros.empty()) return;
     {
         std::lock_guard<std::mutex> lk(g_write_mtx);
@@ -1810,7 +1818,10 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
                 conj.insert(std::get<std::string>(it->second));
         }
     }
-    baixados[r.dataset_idx] += dias_retornados;
+    {
+        std::lock_guard<std::mutex> lk(g_stats_mtx);
+        baixados[r.dataset_idx] += dias_retornados;
+    }
 }
 
 // File limitada (download -> processamento)
@@ -1906,7 +1917,8 @@ static int executar_generico(const std::vector<std::string>& datas, double tempo
     Fila<ResultadoGenerico> fila((size_t)CFG.download_workers * 2);
     std::atomic<size_t> idx_t{0};
     std::atomic<long long> feitas{0};
-    std::cout << "\nStarting " << total << " tasks...\n\n";
+    std::cout << "\nStarting " << total << " tasks (" << CFG.download_workers
+              << " download_workers, " << CFG.process_workers << " process_workers)...\n\n";
     std::vector<std::thread> consumidores;
     for (int i = 0; i < CFG.process_workers; ++i) {
         consumidores.emplace_back([&] {
@@ -2534,18 +2546,46 @@ static void executar_dataset_arquivo(const DatasetCfg& ds) {
 
     Data data_limite = civil_de_dias(dias_de_civil(agora_local().tm_year + 1900, agora_local().tm_mon + 1, agora_local().tm_mday) - dias_atraso);
 
+    std::vector<std::pair<int, int>> meses;
+    for (int ano = ano_inicial; ano <= data_limite.ano; ++ano) {
+        for (int mes = 1; mes <= 12; ++mes) {
+            if (ano == data_limite.ano && mes > data_limite.mes) break;
+            meses.emplace_back(ano, mes);
+        }
+    }
+
+    int n_workers = CFG.download_workers;
+    if (n_workers < 1) n_workers = 1;
+    if ((size_t)n_workers > meses.size() && !meses.empty())
+        n_workers = (int)meses.size();
+
     log("============================================================");
     log("PROCESSANDO DATASET EM ARQUIVOS: " + ds.id);
     log("Diretório de saída: " + pasta_saida.string());
     log("Anos: " + std::to_string(ano_inicial) + " até " + std::to_string(data_limite.ano));
+    log("Meses: " + std::to_string(meses.size()) + " | download_workers=" +
+        std::to_string(n_workers));
     log("============================================================");
 
-    for (int ano = ano_inicial; ano <= data_limite.ano; ++ano) {
-        for (int mes = 1; mes <= 12; ++mes) {
-            if (ano == data_limite.ano && mes > data_limite.mes) break;
-            processar_dataset_era5_mes(ds, ano, mes, api_url, api_key);
-        }
+    std::atomic<size_t> idx_mes{0};
+    std::vector<std::thread> workers;
+    workers.reserve((size_t)n_workers);
+    for (int i = 0; i < n_workers; ++i) {
+        workers.emplace_back([&] {
+            while (true) {
+                size_t k = idx_mes.fetch_add(1);
+                if (k >= meses.size()) break;
+                try {
+                    processar_dataset_era5_mes(ds, meses[k].first, meses[k].second, api_url,
+                                               api_key);
+                } catch (const std::exception& e) {
+                    log(std::string("[ERROR] ERA5 ") + std::to_string(meses[k].first) + "-" +
+                        std::to_string(meses[k].second) + ": " + e.what());
+                }
+            }
+        });
     }
+    for (auto& t : workers) t.join();
 }
 
 int main(int argc, char** argv) {
@@ -2640,7 +2680,9 @@ int main(int argc, char** argv) {
                           << "============================================================\n"
                           << "Configuracao: " << caminho_ini << "\n"
                           << "Fuso horario: " << CFG.fuso_horario << "\n"
-                          << "Banco de dados: " << CFG.db_path << "\n";
+                          << "Banco de dados: " << CFG.db_path << "\n"
+                          << "download_workers: " << CFG.download_workers
+                          << " | process_workers: " << CFG.process_workers << "\n";
 
                 criar_tabelas_datasets();
 

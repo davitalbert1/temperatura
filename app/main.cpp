@@ -36,8 +36,12 @@ private:
     QStringList dbs;
     bool temLatLon = false;
 
-    QString dbAtual() const { return inputDb->text().trimmed(); }
-    QString tabelaAtual() const { return comboTabela->currentText(); }
+    QString dbAtual() const {
+        return inputDb->text().trimmed();
+    }
+    QString tabelaAtual() const {
+        return comboTabela->currentText();
+    }
     static QString aspas(const QString &id) {
         QString esc = id;
         esc.replace("\"", "\"\"");

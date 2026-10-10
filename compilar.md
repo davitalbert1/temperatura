@@ -37,17 +37,22 @@ Isso gera:
 
 ## Executar
 
-Clima viewer (precisa de `clima.db` no diretório atual — existe em `app/`):
+Clima viewer:
 
 ```sh
-cd app
-../build/clima_viewer.exe
+./build/clima_viewer.exe
 ```
 
 Downloader (precisa de `download.ini` na raiz do projeto):
 
 ```sh
 ./build/download.exe ./download.ini
+```
+
+Test (precisa de `download.ini` na raiz do projeto):
+
+```sh
+./build/test.exe ./download.ini
 ```
 
 No PowerShell/VS Code (raiz do projeto):

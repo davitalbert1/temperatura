@@ -30,6 +30,9 @@ find_package(Threads REQUIRED)
 add_executable(download download.cpp)
 target_link_libraries(download PRIVATE CURL::libcurl SQLite3::SQLite3 Threads::Threads)
 
+add_executable(clima_auditor app/test.cpp)
+target_link_libraries(clima_auditor PRIVATE SQLite3::SQLite3)
+
 # nlohmann/json (header-only): usa o pacote CMake se existir,
 # senão procura o include padrão nlohmann/json.hpp
 find_package(nlohmann_json CONFIG QUIET)

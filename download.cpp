@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -33,7 +34,7 @@
 
 using json = nlohmann::json;
 
-// Utilidades de texto / arquivos .ini
+// Utilidades of text / files .ini
 static std::string cortar(const std::string& s) {
     const char* espacos = " \t\r\n";
     size_t i = s.find_first_not_of(espacos);
@@ -64,7 +65,7 @@ static std::string juntar(const std::vector<std::string>& itens, const std::stri
     return out;
 }
 
-// Menor representacao round-trip de um double (igual a str() do Python)
+// Under age acting round-trip of the double (equal the str() of Python)
 static std::string num_str(double v) {
     char buf[64];
     auto res = std::to_chars(buf, buf + sizeof(buf), v);
@@ -111,8 +112,8 @@ static Ini ler_ini(const std::string& caminho) {
     Ini ini;
     std::ifstream arquivo(caminho);
     if (!arquivo) {
-        std::cerr << "[AVISO] Arquivo de configuracao nao encontrado: " << caminho
-                  << " (usando valores padrao)\n";
+        std::cerr << "[WARNING] File of configuracao not found: " << caminho
+                  << " (usando values padrao)\n";
         return ini;
     }
     auto registrar_secao = [&](const std::string& secao) {
@@ -132,12 +133,12 @@ static Ini ler_ini(const std::string& caminho) {
         }
         if (secao.empty()) continue;
         registrar_secao(secao);
-        // Secoes de dataset: aceitam tanto "chave = valor" quanto linhas de
-        // lista ("vars = a, b" ou simplesmente "a, b" / "coluna.x = ...").
+        // Secoes of dataset: aceitam the "key = value" how much linhas of
+        // list ("vars = the, b" or simplesmente "the, b" / "coluna.x = ...").
         if (eh_secao_dataset(secao)) {
             size_t igual = linha.find('=');
             if (igual == std::string::npos) {
-                // Linha solta: trata como item de lista generica da secao.
+                // Thread solta: trata how item of list generica of section.
                 for (auto& token : dividir(linha, ',')) {
                     if (token.empty() || token.find('=') != std::string::npos) continue;
                     ini.listas[secao].push_back(token);
@@ -151,7 +152,7 @@ static Ini ler_ini(const std::string& caminho) {
                 chave == "lista_vars" || chave == "colunas_extra") {
                 for (auto& token : dividir(valor, ',')) {
                     if (token.empty()) continue;
-                    // "col = api:tipo" dentro de vars tambem e aceito.
+                    // "col = api:tipo" dentro of vars also and aceito.
                     size_t dp = token.find(':');
                     std::string nome = cortar(dp == std::string::npos ? token
                                                                       : token.substr(0, dp));
@@ -176,7 +177,7 @@ static Ini ler_ini(const std::string& caminho) {
     return ini;
 }
 
-// Variaveis de configuracao (todas vindas do .ini; env var sobrescreve)
+// Variaveis of configuracao (all vindas of .ini; env var sobrescreve)
 static std::string env_texto(const char* nome, const std::string& padrao) {
     const char* v = std::getenv(nome);
     return v ? std::string(v) : padrao;
@@ -220,8 +221,9 @@ static double para_double(const std::string& s, double padrao) {
 
 static bool para_bool(const std::string& s, bool padrao) {
     std::string v = cortar(s);
-    std::transform(v.begin(), v.end(), v.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
     if (v == "1" || v == "true" || v == "sim" || v == "yes" || v == "on") return true;
     if (v == "0" || v == "false" || v == "nao" || v == "não" || v == "no" || v == "off" ||
         v == "desligado")
@@ -229,8 +231,8 @@ static bool para_bool(const std::string& s, bool padrao) {
     return padrao;
 }
 
-// Nome de coluna/tabela seguro para SQLite: minusculas, [a-z0-9_], sem
-// acento, sem espacos. "pm2.5 (µg/m³)" -> "pm2_5_ug_m3".
+// Name of coluna/tabela insurance to SQLite: minusculas, [a-z0-9_], without
+// accent, without espacos. "pm2.5 (µg/m³)" -> "pm2_5_ug_m3".
 static std::string normalizar_nome(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -239,7 +241,7 @@ static std::string normalizar_nome(const std::string& s) {
             out += static_cast<char>(std::tolower(c));
         else if (c == '_' || c == '-' || c == '.' || c == ' ' || c == '/')
             out += '_';
-        // ignora demais simbolos/acentos
+        // ignora besides simbolos/acentos
     }
     // colapsa underscores
     std::string limpo;
@@ -256,11 +258,11 @@ static std::string normalizar_nome(const std::string& s) {
     return limpo;
 }
 
-// "coluna = api[:tipo]" -> {coluna normalizada, variavel da api, tipo}
-// Sem ":" o tipo e inferido dos dados (auto). Tipos aceitos:
-// real | integer | text (alias: int, float, double, str, string, data, hora).
-// Colunas geridas pelo proprio motor: nunca vem de dados da API e nunca
-// podem ser sobrescritas (a de data/hora usa os nomes configurados).
+// "column = api[:tipo]" -> {column normalizada, variable of api, type}
+// Without ":" the type and inferido of date (car). Tipos aceitos:
+// current | integer | text (the for the rest: int, float, double, str, string, date, hour).
+// Colunas geridas hair decent engine: never vem of date of API and never
+// podem creature sobrescritas (the of data/hora usa the nomes configurados).
 static bool coluna_reservada(const std::string& c) {
     return c == "data" || c == "hora" || c == "timezone" || c == "latitude" ||
            c == "longitude" || c == "created_at";
@@ -268,8 +270,9 @@ static bool coluna_reservada(const std::string& c) {
 
 static std::string normalizar_tipo(const std::string& t) {
     std::string v = cortar(t);
-    std::transform(v.begin(), v.end(), v.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
     if (v.empty() || v == "auto") return "auto";
     if (v == "int" || v == "integer" || v == "bool" || v == "boolean") return "integer";
     if (v == "real" || v == "float" || v == "double" || v == "number" || v == "numeric")
@@ -277,7 +280,7 @@ static std::string normalizar_tipo(const std::string& t) {
     return "text";
 }
 
-// Divide "col = api:tipo" em partes. Retorna false se vazio.
+// Divide "col = api:tipo" in partes. Retorna false if empty.
 static bool separar_def_coluna(const std::string& def, std::string& coluna,
                                std::string& variavel_api, std::string& tipo) {
     std::string d = cortar(def);
@@ -293,7 +296,7 @@ static bool separar_def_coluna(const std::string& def, std::string& coluna,
         if (esq.empty()) esq = dir;
         if (dir.empty()) dir = esq;
     }
-    // dir pode ser "variavel:tipo"
+    // dir pode creature "variavel:tipo"
     size_t dp = dir.find(':');
     std::string var = cortar(dp == std::string::npos ? dir : dir.substr(0, dp));
     std::string tp = dp == std::string::npos ? "auto" : cortar(dir.substr(dp + 1));
@@ -305,38 +308,39 @@ static bool separar_def_coluna(const std::string& def, std::string& coluna,
 }
 
 struct ColunaCfg {
-    std::string coluna;       // nome da coluna no banco (normalizado)
-    std::string variavel_api; // nome da variavel na API/JSON
+    std::string coluna;       // name of column in database (normalizado)
+    std::string variavel_api; // name of variable in API/JSON
     std::string tipo;         // "auto" | "real" | "integer" | "text"
 };
 
-// Dataset generico: uma API (ou recorte dela) -> uma tabela de um banco.
-// Varios datasets podem apontar para o MESMO banco (tabelas diferentes ou
-// ate a mesma tabela -> merge por chave). Cada dataset tambem pode apontar
-// para um banco DIFERENTE (db proprio).
+// Dataset general: the API (or outline her) -> the table of the database.
+// THE few datasets podem aim to the SAME database (tabelas diferentes or
+// until the same table -> merge by key). Each dataset also pode aim
+// to the database OTHER (db decent).
 struct DatasetCfg {
-    std::string id;              // nome da secao sem "dataset:" (ex: "clima_diario")
-    std::string db;              // arquivo sqlite (vazio = db padrao do [geral])
-    std::string tabela;          // tabela destino (padrao = id normalizado)
-    std::string url;             // URL base da API
-    std::string url_passado;     // URL alternativa p/ datas < hoje (ex: archive)
-    std::string url_futuro;      // URL alternativa p/ datas >= hoje (ex: forecast)
-    std::string bloco = "daily"; // bloco JSON com os dados ("daily"|"hourly"|...)
-    std::string params_chave = "daily"; // nome do parametro de query (daily=...&hourly=...)
-    std::vector<std::string> vars;      // variaveis pedidas a API
-    std::set<std::string> vars_excluir; // variaveis removidas quando usa url_passado
-    std::vector<ColunaCfg> colunas;     // overrides opcionais (coluna.*): renomeia/tipa
-    std::string data_min;               // so baixa datas >= data_min ("", data ou "hoje")
-    std::string data_max;               // so baixa datas <= data_max ("", data ou "hoje")
-    std::string granularidade = "dia";  // "dia" (time=YYYY-MM-DD) | "hora" (time completo)
-    bool salvar_hora = false;           // cria coluna "hora" com o time completo
-    bool salvar_timezone = false;       // cria coluna "timezone"
-    std::string chave_data = "data";    // coluna da data ("" = sem coluna de data)
-    std::string chave_hora = "hora";    // coluna da hora ("" = sem coluna de hora)
+    std::string id;              // name of section without "dataset:" (ex: "clima_diario")
+    std::string db;              // file sqlite (empty = db norm of [general])
+    std::string tabela;          // table target (norm = id normalizado)
+    std::string url;             // URL element of API
+    std::string url_passado;     // URL alternate p/ datas < today (ex: archive)
+    std::string url_futuro;      // URL alternate p/ datas >= today (ex: forecast)
+    std::string bloco = "daily"; // block JSON with the date ("daily"|"hourly"|...)
+    std::string params_chave = "daily"; // name of parameter of query (daily=...&hourly=...)
+    std::vector<std::string> vars;      // variaveis pedidas the API
+    std::set<std::string> vars_excluir; // variaveis removidas when usa url_passado
+    std::vector<ColunaCfg> colunas;     // overrides opcionais (column.*): renomeia/tipa
+    std::string data_min;               // exclusively baixa datas >= data_min ("", date or "today")
+    std::string data_max;               // exclusively baixa datas <= data_max ("", date or "today")
+    std::string granularidade = "dia";  // "day" (time=YYYY-MM-DD) | "hour" (team absolute)
+    bool salvar_hora = false;           // cria column "hour" with the team absolute
+    bool salvar_timezone = false;       // cria column "timezone"
+    std::string chave_data = "data";    // column of date ("" = without column of date)
+    std::string chave_hora = "hour";    // column of hour ("" = without column of hour)
+    std::string api_keys;               // chaves "k1 | k2" (empty = herda [general] api_keys)
 };
 
 struct Config {
-    // [geral] - espelham as variaveis do download.py
+    // [general] - espelham the variaveis of download.py
     std::string db_path = "clima.db";
     int max_sql_dates_por_lote = 900;
     int download_workers = 5;
@@ -348,36 +352,50 @@ struct Config {
     double jitter_inicial_max = 5.0;
     double backoff_inicial = 2.0;
     double backoff_maximo = 60.0;
-    double min_rps = 5.0;
+    double min_rps = 0.5;
     double cooldown_429 = 30.0;
     int circuit_limit_429 = 3;
     double espera_min_429 = 5.0;
+    // Budget of chamadas: janelas deslizantes in unidades fracionarias
+    // (FAQ Open-Meteo: cost by request = max(1, vars/10, dias*1.5/14)).
+    // Limites oficiais of tier gratuito: 600/min, 5000/h, 10000/dia.
+    // 0 desliga the window. Without key of API all the URLs compartilham the
+    // same budget ("anonymous"); with api_keys each key tem the his.
+    double limite_minuto = 600.0;
+    double limite_hora = 5000.0;
+    double limite_dia = 10000.0;
+    double custo_vars_ref = 10.0;  // cost = max(1, vars/custo_vars_ref, ...)
+    double custo_dias_ref = 14.0;  // max(..., dias*custo_dias_fator/custo_dias_ref)
+    double custo_dias_fator = 1.5;
+    double cooldown_quota = 900.0; // break global p/ 429 of quota (daily/hourly)
+    std::string api_keys; // "k1 | k2" - rotacionadas by request
+    std::string api_key_param = "apikey"; // name of parameter of key in URL
     std::string fuso_horario = "America/Sao_Paulo";
     std::string periodo_inicio = "1940-01-01";
     std::string periodo_fim = "2025-12-31";
-    // Datasets genericos: cada [dataset:<id>] vira uma tabela em um banco.
-    // Varios datasets podem compartilhar o mesmo .db (tabelas iguais ou
-    // diferentes -> merge por chave) e um dataset pode ter db proprio.
+    // Datasets genericos: each [dataset:<id>] vira the table in the database.
+    // THE few datasets podem share the same .db (tabelas iguais or
+    // diferentes -> merge by key) and the dataset pode give birth db decent.
     std::vector<DatasetCfg> datasets;
 
-    // [coordenadas] - padrao: as mesmas do download.py
+    // [coordenadas] - norm: the mesmas of download.py
     std::vector<std::pair<double, double>> coordenadas = {
-        {-23.5505, -46.6333}, // Sao Paulo, Brasil
-        {-26.3044, -48.8456}, // Joinville, Brasil
-        {-25.4278, -49.2731}, // Curitiba, Brasil
-        {-28.7833, -51.6100}, // Guapore, Brasil
-        {-20.4697, -54.6201}, // Campo Grande, Brasil
-        {-3.1019, -60.0250}, // Manaus, Brasil
-        {-3.7250, -38.5236}, // Fortaleza, Brasil
-        {52.5200, 13.4050}, // Berlim, Alemanha
-        {35.6762, 139.6503}, // Tquio, Japao
-        {40.7128, -74.0060}, // Nova York, Estados Unidos
+        {-23.5505, -46.6333}, // Healthy Paulo, Brazil
+        {-26.3044, -48.8456}, // Joinville, Brazil
+        {-25.4278, -49.2731}, // Curitiba, Brazil
+        {-28.7833, -51.6100}, // Guapore, Brazil
+        {-20.4697, -54.6201}, // Country Large, Brazil
+        {-3.1019, -60.0250}, // Manaus, Brazil
+        {-3.7250, -38.5236}, // Fortification, Brazil
+        {52.5200, 13.4050}, // Berlin, Germany
+        {35.6762, 139.6503}, // Tquio, Japan
+        {40.7128, -74.0060}, // New York, Estados Unidos
         {55.7558, 37.6173}, // Moscou, Russia
         {43.1155, 131.8855}, // Vladivostok, Russia
         {-33.4489, -70.6693}, // Santiago, Chile
         {-54.8019, -68.3030}, // Ushuaia, Argentina
-        {-33.9249, 18.4241}, // Cidade do Cabo, Africa do Sul
-        {19.4326, -99.1332}, // Cidade do Mexico, Mexico
+        {-33.9249, 18.4241}, // City state of Cable, Africa of South
+        {19.4326, -99.1332}, // City state of Mexico, Mexico
         {61.2181, -149.9003}, // Anchorage, Estados Unidos
     };
 
@@ -397,13 +415,16 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.url = cortar(ini.obter_ou(secao, "url"));
         d.url_passado = cortar(ini.obter_ou(secao, "url_passado"));
         d.url_futuro = cortar(ini.obter_ou(secao, "url_futuro"));
-        d.bloco = cortar(ini.obter_ou(secao, "bloco", "daily"));
+        d.api_keys = cortar(ini.obter_ou(secao, "api_keys"));
+        // Aceita tanto "bloco" (pt, usado no download.ini) quanto "block" (en).
+        d.bloco = cortar(ini.obter_ou(secao, "bloco"));
+        if (d.bloco.empty()) d.bloco = cortar(ini.obter_ou(secao, "block", "daily"));
         if (d.bloco.empty()) d.bloco = "daily";
         d.params_chave = cortar(ini.obter_ou(secao, "params_chave", d.bloco));
         if (d.params_chave.empty()) d.params_chave = d.bloco;
         // 1) Overrides opcionais coluna.<nome> = <var_api>[:tipo]: renomeiam/
-        //    tipam uma coluna descoberta automaticamente (nao sao obrigatorios)
-        //    e garantem que a variavel seja pedida a API.
+        //    tipam the column descoberta automatically (not healthy obrigatorios)
+        //    and garantem that the variable seja pedida the API.
         auto add_coluna = [&](const std::string& c, const std::string& v,
                               const std::string& tp) {
             for (auto& cc : d.colunas) {
@@ -421,9 +442,17 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         };
         auto it_sec = ini.valores.find(secao);
         if (it_sec != ini.valores.end()) {
-            std::map<std::string, std::string> defs; // ordenada -> ordem estavel
+            std::map<std::string, std::string> defs; // ordenada -> order stable
             for (const auto& kv : it_sec->second) {
-                if (kv.first.rfind("coluna.", 0) == 0) defs[kv.first.substr(7)] = kv.second;
+                // Aceita "coluna." (pt, doc do download.ini) e "column." (en).
+                std::string resto;
+                if (kv.first.rfind("coluna.", 0) == 0)
+                    resto = kv.first.substr(7);
+                else if (kv.first.rfind("column.", 0) == 0)
+                    resto = kv.first.substr(7);
+                else
+                    continue;
+                defs[resto] = kv.second;
             }
             for (const auto& kv : defs) {
                 std::string c, v, tp;
@@ -433,10 +462,10 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
                 add_var(v);
             }
         }
-        // 2) vars / linhas soltas: apenas pedem variaveis a API. Coluna so e
-        //    declarada quando ha tipo explicito ("<var>:<tipo>"); sem isso a
-        //    coluna e descoberta automaticamente da resposta JSON (runtime),
-        //    com o tipo inferido dos dados no CREATE TABLE / ADD COLUMN.
+        // 2) vars / linhas soltas: only pedem variaveis the API. Column exclusively and
+        //    declarada when there is type formal ("<var>:<tipo>"); without that the
+        //    column and descoberta automatically of response JSON (runtime),
+        //    with the type inferido of date in CREATE TABLE / ADD COLUMN.
         std::vector<std::string> crus;
         for (const auto& t : dividir(ini.obter_ou(secao, "vars"), ',')) crus.push_back(t);
         for (const auto& t : ini.lista(secao)) crus.push_back(t);
@@ -450,32 +479,30 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
                             t.find(':') != std::string::npos;
             if (explicito) add_coluna(c, v, tp);
         }
-        // 3) vars_excluir e demais chaves de filtro.
+        // 3) vars_excluir and besides chaves of filter.
         for (const auto& t : dividir(ini.obter_ou(secao, "vars_excluir"), ',')) {
             if (!t.empty()) d.vars_excluir.insert(t);
         }
         d.data_min = cortar(ini.obter_ou(secao, "data_min"));
         d.data_max = cortar(ini.obter_ou(secao, "data_max"));
         std::string gran = cortar(ini.obter_ou(secao, "granularidade", "dia"));
-        std::transform(gran.begin(), gran.end(), gran.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        d.granularidade =
-            (gran == "hora" || gran == "horario" || gran == "hourly") ? "hora" : "dia";
-        d.salvar_hora =
-            para_bool(ini.obter_ou(secao, "salvar_hora", d.granularidade == "hora" ? "1" : "0"),
-                      d.granularidade == "hora");
+        std::transform(gran.begin(), gran.end(), gran.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        d.granularidade = (gran == "hora" || gran == "horario" || gran == "hourly") ? "hour" : "dia";
+        d.salvar_hora = para_bool(ini.obter_ou(secao, "salvar_hora", d.granularidade == "hour" ? "1" : "0"), d.granularidade == "hour");
         d.salvar_timezone = para_bool(ini.obter_ou(secao, "salvar_timezone", "0"), false);
         std::string cd = cortar(ini.obter_ou(secao, "chave_data", "data"));
         d.chave_data = cd.empty() ? "" : normalizar_nome(cd);
-        std::string ch = cortar(ini.obter_ou(secao, "chave_hora", "hora"));
+        std::string ch = cortar(ini.obter_ou(secao, "chave_hora", "hour"));
         d.chave_hora = ch.empty() ? "" : normalizar_nome(ch);
         if (d.url.empty()) {
-            std::cerr << "[AVISO] Dataset '" << d.id << "' ignorado (url vazia).\n";
+            std::cerr << "[WARNING] Dataset '" << d.id << "' ignorado (url vazia).\n";
             continue;
         }
         if (d.vars.empty())
-            std::cerr << "[AVISO] Dataset '" << d.id
-                      << "': sem 'vars' - a API decide o que retorna.\n";
+            std::cerr << "[WARNING] Dataset '" << d.id
+                      << "': without 'vars' - the API decide the that retorna.\n";
         out.push_back(std::move(d));
     }
     return out;
@@ -486,14 +513,19 @@ static void carregar_config(const std::string& caminho) {
     std::string v;
 
     auto le_texto = [&](const char* sec, const char* chave, std::string& alvo) {
+        // Aceita tanto [geral] (pt) quanto [general] (en).
         if (ini.obter(sec, chave, v)) alvo = v;
+        if (std::string(sec) == "geral" && ini.obter("general", chave, v)) alvo = v;
+        if (std::string(sec) == "general" && ini.obter("geral", chave, v)) alvo = v;
     };
     auto le_int = [&](const char* chave, const char* env, int& alvo) {
         if (ini.obter("geral", chave, v)) alvo = para_int(v, alvo);
+        if (ini.obter("general", chave, v)) alvo = para_int(v, alvo);
         if (env) alvo = env_int(env, alvo);
     };
     auto le_dbl = [&](const char* chave, const char* env, double& alvo) {
         if (ini.obter("geral", chave, v)) alvo = para_double(v, alvo);
+        if (ini.obter("general", chave, v)) alvo = para_double(v, alvo);
         if (env) alvo = env_double(env, alvo);
     };
 
@@ -512,9 +544,18 @@ static void carregar_config(const std::string& caminho) {
     le_dbl("cooldown_429", "OPENMETEO_COOLDOWN_429", CFG.cooldown_429);
     le_int("circuit_limit_429", "OPENMETEO_429_CIRCUIT_LIMIT", CFG.circuit_limit_429);
     le_dbl("espera_min_429", "OPENMETEO_429_ESPERA_MIN", CFG.espera_min_429);
-    le_texto("geral", "fuso_horario", CFG.fuso_horario);
-    le_texto("geral", "periodo_inicio", CFG.periodo_inicio);
-    le_texto("geral", "periodo_fim", CFG.periodo_fim);
+    le_dbl("limite_minuto", "OPENMETEO_LIMITE_MINUTO", CFG.limite_minuto);
+    le_dbl("limite_hora", "OPENMETEO_LIMITE_HORA", CFG.limite_hora);
+    le_dbl("limite_dia", "OPENMETEO_LIMITE_DIA", CFG.limite_dia);
+    le_dbl("custo_vars_ref", nullptr, CFG.custo_vars_ref);
+    le_dbl("custo_dias_ref", nullptr, CFG.custo_dias_ref);
+    le_dbl("custo_dias_fator", nullptr, CFG.custo_dias_fator);
+    le_dbl("cooldown_quota", "OPENMETEO_COOLDOWN_QUOTA", CFG.cooldown_quota);
+    le_texto("general", "api_keys", CFG.api_keys);
+    le_texto("general", "api_key_param", CFG.api_key_param);
+    le_texto("general", "fuso_horario", CFG.fuso_horario);
+    le_texto("general", "periodo_inicio", CFG.periodo_inicio);
+    le_texto("general", "periodo_fim", CFG.periodo_fim);
 
     auto coord_linhas = ini.lista("coordenadas");
     if (!coord_linhas.empty()) {
@@ -522,13 +563,13 @@ static void carregar_config(const std::string& caminho) {
         for (const auto& l : coord_linhas) {
             auto partes = dividir(l, ',');
             if (partes.size() < 2) {
-                std::cerr << "[AVISO] Coordenada invalida ignorada: " << l << "\n";
+                std::cerr << "[WARNING] Coordenada invalida ignorada: " << l << "\n";
                 continue;
             }
             try {
                 coords.emplace_back(std::stod(partes[0]), std::stod(partes[1]));
             } catch (...) {
-                std::cerr << "[AVISO] Coordenada invalida ignorada: " << l << "\n";
+                std::cerr << "[WARNING] Coordenada invalida ignorada: " << l << "\n";
             }
         }
         if (!coords.empty()) CFG.coordenadas = coords;
@@ -540,16 +581,29 @@ static void carregar_config(const std::string& caminho) {
     if (CFG.max_sql_dates_por_lote < 1) CFG.max_sql_dates_por_lote = 1;
     if (CFG.requests_per_second <= 0.0) CFG.requests_per_second = 1.0;
     if (CFG.max_retries < 1) CFG.max_retries = 1;
+    if (CFG.limite_minuto < 0.0) CFG.limite_minuto = 0.0;
+    if (CFG.limite_hora < 0.0) CFG.limite_hora = 0.0;
+    if (CFG.limite_dia < 0.0) CFG.limite_dia = 0.0;
+    if (CFG.custo_vars_ref <= 0.0) CFG.custo_vars_ref = 10.0;
+    if (CFG.custo_dias_ref <= 0.0) CFG.custo_dias_ref = 14.0;
+    if (CFG.custo_dias_fator <= 0.0) CFG.custo_dias_fator = 1.5;
+    if (CFG.cooldown_quota <= 0.0) CFG.cooldown_quota = 300.0;
+    if (CFG.api_key_param.empty()) CFG.api_key_param = "apikey";
+    // min_rps and the piso of percent: never adult that the propria percent (senao the
+    // 429 AUMENTARIA the speed) neither <= 0.
+    if (CFG.min_rps <= 0.0) CFG.min_rps = CFG.requests_per_second * 0.1;
+    if (CFG.min_rps > CFG.requests_per_second) CFG.min_rps = CFG.requests_per_second;
     CFG.datasets = montar_datasets_genericos(ini);
-    // db vazio no dataset = db padrao do [geral]
+    // db empty in dataset = db norm of [general]; api_keys empty = herda [general]
     for (auto& d : CFG.datasets) {
         if (d.db.empty()) d.db = CFG.db_path;
+        if (d.api_keys.empty()) d.api_keys = CFG.api_keys;
     }
 }
 
-// Log + utilidades de data
+// Log + utilidades of date
 static std::mutex g_print_mtx;
-static std::mutex g_write_mtx; // serializa gravacoes no banco (equivale write_lock)
+static std::mutex g_write_mtx; // serializa gravacoes in database (equivale write_lock)
 
 static void log(const std::string& msg) {
     std::lock_guard<std::mutex> lk(g_print_mtx);
@@ -564,11 +618,11 @@ static Data para_data(const std::string& s) {
     Data d;
     if (std::sscanf(s.c_str(), "%d-%d-%d", &d.ano, &d.mes, &d.dia) != 3 || d.mes < 1 ||
         d.mes > 12 || d.dia < 1 || d.dia > 31)
-        throw std::runtime_error("data invalida: " + s);
+        throw std::runtime_error("date invalida: " + s);
     return d;
 }
 
-// Algoritmo de Howard Hinnant (days_from_civil / civil_from_days)
+// Algorithm of Howard Hinnant (days_from_civil / civil_from_days)
 static long dias_de_civil(int y, int m, int d) {
     y -= m <= 2;
     const long era = (y >= 0 ? y : y - 399) / 400;
@@ -612,7 +666,7 @@ static std::tm agora_local() {
     return tmv;
 }
 
-// Data local no formato YYYY-MM-DD (compara lexicograficamente com as datas)
+// Date place in formato YYYY-MM-DD (compara lexicograficamente with the datas)
 static std::string hoje() {
     std::tm tmv = agora_local();
     char b[16];
@@ -636,34 +690,83 @@ static std::vector<std::string> expandir_periodo(const std::string& inicio, cons
         for (long i = ia; i <= ib; ++i) datas.push_back(data_texto(civil_de_dias(i)));
         return datas;
     } catch (const std::exception& e) {
-        log(std::string("[AVISO] Erro ao processar datas: ") + e.what());
+        log(std::string("[WARNING] Error at go to court datas: ") + e.what());
         return {inicio, fim};
     }
 }
 
-// Rate-limit (token bucket adaptativo) + backoff
+// Rate-limit: budget in window deslizante (minuto/hora/dia, in unidades
+// fracionarias of chamada) + espacamento global of envios by reserva of
+// slot + cooldown of 429 compartilhado by all the threads.
 static std::mutex g_rate_mtx;
-static double g_tokens = 0.0;
-static double g_rps_atual = 0.0;
-static std::chrono::steady_clock::time_point g_ultimo_refil;
-// Cooldown absoluto baseado em epoch (evita erro de acumulacao de delta)
-static std::chrono::steady_clock::time_point g_cooldown_inicio;
-static double g_cooldown_atual = 0.0;
-static int g_cooldown_ativo = 0;
+static std::chrono::steady_clock::time_point g_proximo_slot; // next envio permitido
+static double g_intervalo = 0.25; // segundos between envios (1 / rps current)
+// Cooldown global absoluto (epoch steady): all the threads esperam until he
+static std::chrono::steady_clock::time_point g_cooldown_fim;
 static int g_429_consecutivos = 0;
+// Cooldown by endpoint (rotacao of multiplas URLs "the | b")
+static std::map<std::string, std::chrono::steady_clock::time_point> g_ep_cooldown;
+
+// Budget by bevy of quota: key of API (each key = quota propria) or
+// "anonymous" (tier gratuito without key: all the URLs compartilham the quota of IP).
+struct Janela {
+    std::deque<std::pair<std::chrono::steady_clock::time_point, double>> ev; // by ts
+    double soma = 0.0;
+
+    void limpar(std::chrono::steady_clock::time_point agora, double dur) {
+        auto corte = agora - std::chrono::duration<double>(dur);
+        while (!ev.empty() && !(ev.front().first > corte)) {
+            soma -= ev.front().second;
+            ev.pop_front();
+        }
+    }
+    // Segundos necessarios to cabir `cost` (0 = already cabe). Not reserva.
+    double espera(std::chrono::steady_clock::time_point agora, double dur,
+                  double limite, double custo) const {
+        if (limite <= 0.0 || soma + custo <= limite) return 0.0;
+        if (ev.empty()) return 0.0; // cost > limit: deixa the request fare
+        auto expira = ev.front().first + std::chrono::duration<double>(dur);
+        double w = std::chrono::duration<double>(expira - agora).count();
+        return w > 0.0 ? w + 0.05 : 0.05;
+    }
+    void reservar(std::chrono::steady_clock::time_point ts, double custo) {
+        ev.emplace_back(ts, custo);
+        soma += custo;
+    }
+};
+struct Orcamento {
+    Janela minuto, hora, dia;
+
+    void limpar(const std::chrono::steady_clock::time_point& agora) {
+        minuto.limpar(agora, 60.0);
+        hora.limpar(agora, 3600.0);
+        dia.limpar(agora, 86400.0);
+    }
+    double espera(std::chrono::steady_clock::time_point agora, double custo) const {
+        return std::max({minuto.espera(agora, 60.0, CFG.limite_minuto, custo),
+                         hora.espera(agora, 3600.0, CFG.limite_hora, custo),
+                         dia.espera(agora, 86400.0, CFG.limite_dia, custo)});
+    }
+    void reservar(std::chrono::steady_clock::time_point ts, double custo) {
+        minuto.reservar(ts, custo);
+        hora.reservar(ts, custo);
+        dia.reservar(ts, custo);
+    }
+};
+static std::map<std::string, Orcamento> g_orcamento;
 
 static void iniciar_rate_limit() {
     std::lock_guard<std::mutex> lk(g_rate_mtx);
-    g_tokens = CFG.requests_per_second;
-    g_rps_atual = CFG.requests_per_second;
-    g_ultimo_refil = std::chrono::steady_clock::now();
-    g_cooldown_inicio = std::chrono::steady_clock::now();
-    g_cooldown_atual = 0.0;
-    g_cooldown_ativo = 0;
+    auto agora = std::chrono::steady_clock::now();
+    g_proximo_slot = agora;
+    g_intervalo = 1.0 / CFG.requests_per_second;
+    g_cooldown_fim = agora;
     g_429_consecutivos = 0;
+    g_orcamento.clear();
+    g_ep_cooldown.clear();
 }
 
-// Gerador por thread (thread-safe por construcao)
+// Gerador by thread (thread-safe by building)
 static std::mt19937& rng() {
     static thread_local std::mt19937 gen{
         static_cast<std::mt19937::result_type>(std::random_device{}() ^
@@ -677,88 +780,120 @@ static void dormir(double segundos) {
         std::this_thread::sleep_for(std::chrono::duration<double>(segundos));
 }
 
-// Deve ser chamada com g_rate_mtx segurado
-static double proxima_espera() {
-    auto agora = std::chrono::steady_clock::now();
-    if (g_cooldown_ativo) {
-        // Cooldown absoluto baseado em epoch (nao em acumulacao de delta)
-        double restante = g_cooldown_atual -
-                          std::chrono::duration<double>(agora - g_cooldown_inicio).count();
-        if (restante > 0) return restante;
-        // Cooldown expirado: limpa flag e continua
-        g_cooldown_ativo = 0;
-        g_cooldown_atual = 0.0;
+// Expectation until be able to send and RESERVA slot of envio + budget atomicamente
+// (the two reservas in the exclusively lock impedem that threads disparem in rajada and
+// that ultrapassem juntas the janelas of minuto/hora/dia).
+static void esperar_envio(const std::string& grupo, double custo) {
+    static std::atomic<long long> g_ult_log_orc{0};
+    for (int volta = 0; volta < 5000; ++volta) {
+        double espera = 0.0;
+        bool reservado = false;
+        bool por_orcamento = false;
+        {
+            std::lock_guard<std::mutex> lk(g_rate_mtx);
+            auto agora = std::chrono::steady_clock::now();
+            // 1) cooldown global of 429 (compartilhado by all the threads)
+            if (agora < g_cooldown_fim)
+                espera = std::chrono::duration<double>(g_cooldown_fim - agora).count();
+            // 2) janelas of budget (minuto/hora/dia)
+            if (espera <= 0.0) {
+                auto& orc = g_orcamento[grupo];
+                orc.limpar(agora);
+                espera = orc.espera(agora, custo);
+                por_orcamento = espera > 0.0;
+            }
+            // 3) all livre: reserva slot + budget of the occasion
+            if (espera <= 0.0) {
+                auto& orc = g_orcamento[grupo];
+                auto slot = std::max(agora, g_proximo_slot);
+                std::uniform_real_distribution<double> jit(0.9, 1.1);
+                g_proximo_slot = slot + std::chrono::duration_cast<
+                    std::chrono::steady_clock::duration>(
+                                     std::chrono::duration<double>(
+                                         g_intervalo * jit(rng())));
+                orc.reservar(slot, custo);
+                espera = std::chrono::duration<double>(slot - agora).count();
+                reservado = true;
+            }
+        }
+        if (reservado) {
+            dormir(espera);
+            return;
+        }
+        // Log in short supply of expectation longa of budget (1 thread / 60s)
+        if (por_orcamento && espera > 30.0) {
+            long long seg = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+            long long ult = g_ult_log_orc.load();
+            if (seg - ult >= 60 && g_ult_log_orc.compare_exchange_strong(ult, seg)) {
+                char buf[200];
+                std::snprintf(buf, sizeof(buf),
+                              "  [BUDGET] Quota of API atingida (bevy %s). "
+                              "Waiting %.0fs to liberar...",
+                              grupo.c_str(), espera);
+                log(buf);
+            }
+        }
+        dormir(espera > 0.0 ? espera : 0.05);
     }
-
-    double desde = std::chrono::duration<double>(agora - g_ultimo_refil).count();
-    g_tokens = std::min(g_rps_atual, g_tokens + desde * g_rps_atual);
-    g_ultimo_refil = agora;
-
-    if (g_tokens >= 1.0) {
-        g_tokens -= 1.0;
-        return 0.0;
-    }
-    return (1.0 - g_tokens) / g_rps_atual;
+    log("  [WARNING] Budget not liberou after too many esperas; seguindo same so.");
 }
 
-static void esperar_rate_limit() {
-    double espera;
-    {
-        std::lock_guard<std::mutex> lk(g_rate_mtx);
-        espera = proxima_espera();
-    }
-    dormir(espera);
-}
-
-static void reduzir_taxa_429() {
+// Registra the 429: fold the interval between envios (AIMD), bead to the
+// circuit breaker and ativa the cooldown GLOBAL (epoch steady) compartilhado
+// by all the threads. Before, each thread esperava by bead propria
+// while the outras continuavam enviando - era the "hurricane" of 429.
+// `endpoint` (URL element) entra in cooldown decent p/ rotacao "the | b".
+static void tratar_429(double espera, const std::string& motivo,
+                       const std::string& endpoint) {
     std::lock_guard<std::mutex> lk(g_rate_mtx);
-    g_429_consecutivos++;
-    // Reduz a taxa pela metade a cada 429, respeitando o piso min_rps
-    g_rps_atual = std::max(CFG.min_rps, g_rps_atual * 0.5);
-    g_tokens = std::min(g_tokens, g_rps_atual);
+    auto agora = std::chrono::steady_clock::now();
+    // AIMD: fold the interval the each 429 (piso of lentidao = 1/min_rps)
+    double intervalo_max = (CFG.min_rps > 0.0) ? 1.0 / CFG.min_rps : 1.0e9;
+    g_intervalo = std::min(intervalo_max, g_intervalo * 2.0);
+    // Bead exclusively 429s that chegam abroad of the cooldown already ativo (evita that 3
+    // threads simultaneas inflacionem the contador and reativem the breaker).
+    if (agora >= g_cooldown_fim) g_429_consecutivos++;
+    std::string motivo_final = motivo;
     if (g_429_consecutivos >= CFG.circuit_limit_429) {
-        // Cooldown absoluto baseado em epoch para evitar deriva de delta
-        g_cooldown_inicio = std::chrono::steady_clock::now();
-        g_cooldown_atual = CFG.cooldown_429;
-        g_cooldown_ativo = 1;
-        char buf[200];
-        std::snprintf(buf, sizeof(buf),
-                      "  [429] Circuit breaker ativado. Pausa global de %.0fs "
-                      "(taxa: %.2f req/s)",
-                      g_cooldown_atual, g_rps_atual);
-        log(buf);
+        espera = std::max(espera, CFG.cooldown_429);
+        motivo_final = "circuit breaker";
         g_429_consecutivos = 0;
     }
+    if (espera > 0.0) {
+        auto novo_fim = agora + std::chrono::duration_cast<
+            std::chrono::steady_clock::duration>(std::chrono::duration<double>(espera));
+        if (novo_fim > g_cooldown_fim) {
+            bool primeiro = agora >= g_cooldown_fim;
+            g_cooldown_fim = novo_fim;
+            // Log alone by event (not the thread by thread in expectation)
+            if (primeiro || espera > 30.0) {
+                char buf[220];
+                std::snprintf(buf, sizeof(buf),
+                              "  [429] Break global of %.0fs (%s; interval %.2fs)",
+                              espera, motivo_final.c_str(), g_intervalo);
+                log(buf);
+            }
+        }
+    }
+    if (!endpoint.empty() && espera > 0.0) {
+        auto fim_ep = agora + std::chrono::duration_cast<
+            std::chrono::steady_clock::duration>(std::chrono::duration<double>(espera));
+        auto& c = g_ep_cooldown[endpoint];
+        if (fim_ep > c) c = fim_ep;
+    }
 }
 
+// Success: reseta the contador of circuit breaker and recupera the percent aos
+// poucos. NOT grate the cooldown ativo (bug old: any success in
+// flight derrubava the break global and the access 429 recomecava in hour).
 static void restaurar_taxa() {
     std::lock_guard<std::mutex> lk(g_rate_mtx);
     g_429_consecutivos = 0;
-    g_cooldown_ativo = 0;
-    // Retoma gradualmente a taxa a cada sucesso (evita picos apos 429)
-    if (g_rps_atual < CFG.requests_per_second)
-        g_rps_atual = std::min(CFG.requests_per_second, g_rps_atual * 1.2);
-    g_tokens = std::min(g_tokens, g_rps_atual);
-}
-
-static void esperar_cooldown_global() {
-    double espera;
-    {
-        std::lock_guard<std::mutex> lk(g_rate_mtx);
-        // Cooldown absoluto baseado em epoch (evita erro de acumulacao de delta)
-        if (g_cooldown_ativo) {
-            espera = g_cooldown_atual - std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - g_cooldown_inicio).count();
-        } else {
-            espera = 0.0;
-        }
-    }
-    if (espera > 0) {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "  [PAUSA GLOBAL] Aguardando %.1fs (cooldown 429)...", espera);
-        log(buf);
-        dormir(espera);
-    }
+    double intervalo_min = 1.0 / CFG.requests_per_second;
+    if (g_intervalo > intervalo_min)
+        g_intervalo = std::max(intervalo_min, g_intervalo * 0.85);
 }
 
 static double backoff_exponencial(int tentativa) {
@@ -767,16 +902,16 @@ static double backoff_exponencial(int tentativa) {
     return std::min(CFG.backoff_maximo, bruto * dist(rng()));
 }
 
-// Banco de dados (SQLite) - uma conexao por thread por arquivo, pois o mesmo
-// download pode gravar em varios .db ao mesmo tempo (multiplas APIs).
-// Tipos de valor usados pelo motor generico.
+// Database of date (SQLite) - the connection by thread by file, therefore the same
+// download pode engrave in the few .db at same team (multiplas APIs).
+// Tipos of value usados hair engine general.
 using Valor = std::variant<std::monostate, double, std::string>;
 using Registro = std::map<std::string, Valor>;
 
 static void executar_sql(sqlite3* conn, const char* sql) {
     char* erro = nullptr;
     if (sqlite3_exec(conn, sql, nullptr, nullptr, &erro) != SQLITE_OK) {
-        std::string msg = erro ? erro : "erro desconhecido";
+        std::string msg = erro ? erro : "error unknown";
         sqlite3_free(erro);
         throw std::runtime_error("SQLite: " + msg);
     }
@@ -787,15 +922,15 @@ static void executar_sql(sqlite3* conn, const std::string& sql) {
 }
 
 static sqlite3* get_connection_para(const std::string& db_path) {
-    // Cache thread-local: caminho -> conexao (um download pode usar N bancos).
+    // Cache thread-local: path -> connection (the download pode use N bancos).
     static thread_local std::map<std::string, sqlite3*> conns;
     auto it = conns.find(db_path);
     if (it != conns.end() && it->second) return it->second;
     sqlite3* conn = nullptr;
     if (sqlite3_open(db_path.c_str(), &conn) != SQLITE_OK) {
-        std::string msg = conn ? sqlite3_errmsg(conn) : "falha ao abrir";
+        std::string msg = conn ? sqlite3_errmsg(conn) : "failure at open";
         if (conn) sqlite3_close(conn);
-        throw std::runtime_error("SQLite: nao foi possivel abrir " + db_path + ": " + msg);
+        throw std::runtime_error("SQLite: not foi possible open " + db_path + ": " + msg);
     }
     executar_sql(conn, "PRAGMA journal_mode=WAL");
     executar_sql(conn, "PRAGMA synchronous=NORMAL");
@@ -804,15 +939,15 @@ static sqlite3* get_connection_para(const std::string& db_path) {
     return conn;
 }
 
-
 static std::string resolver_data_limite(const std::string& v, const std::string& padrao) {
     std::string s = cortar(v);
     if (s.empty()) return padrao;
     std::string low = s;
-    std::transform(low.begin(), low.end(), low.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
     if (low == "hoje" || low == "today" || low == "now") return hoje();
-    return s; // data YYYY-MM-DD compara lexicograficamente
+    return s; // date YYYY-MM-DD compara lexicograficamente
 }
 
 static bool data_no_intervalo(const std::string& d, const DatasetCfg& ds) {
@@ -823,9 +958,9 @@ static bool data_no_intervalo(const std::string& d, const DatasetCfg& ds) {
     return true;
 }
 
-// Infere o tipo SQLite de uma coluna a partir dos valores observados.
-// "auto" -> integer se todos forem inteiros, real se houver decimal,
-// text se houver qualquer string/data. Tipo declarado no .ini prevalece.
+// Infere the type SQLite of the column the start running of values observados.
+// "auto" -> integer if all are integers, "real" if any decimal,
+// text if houver any string/data. Type declarado in .ini prevalece.
 static std::string inferir_tipo_coluna(const std::string& declarado,
                                        const std::vector<Registro>& regs,
                                        const std::string& coluna) {
@@ -874,12 +1009,12 @@ static std::vector<std::string> colunas_da_tabela(sqlite3* conn, const std::stri
     return out;
 }
 
-// Cria a tabela do dataset automaticamente (ou evolui com ADD COLUMN).
-// Colunas: reservadas (data/hora/lat/lon) + descobertas da resposta da API
-// (amostra) + overrides opcionais do .ini + created_at. As colunas ja
-// existentes sao verificadas via PRAGMA table_info (so ADD COLUMN o que falta)
-// e os tipos vem inferidos dos dados quando nao declarados.
-// Chave UNIQUE: (data,lat,lon) p/ diario ou (data,hora,lat,lon) p/ horario.
+// Cria the table of dataset automatically (or evolui with ADD COLUMN).
+// Colunas: reservadas (data/hora/lat/lon) + descobertas of response of API
+// (test) + overrides opcionais of .ini + created_at. The colunas already
+// existentes healthy verificadas road PRAGMA table_info (exclusively ADD COLUMN the that absence)
+// and the tipos vem inferidos of date when not declarados.
+// Key UNIQUE: (data,lat,lon) p/ diary or (data,hora,lat,lon) p/ schedule.
 static void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& amostra) {
     sqlite3* conn = get_connection_para(ds.db);
     std::vector<std::string> ordem;
@@ -892,8 +1027,8 @@ static void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& a
         if (std::find(ordem.begin(), ordem.end(), c.coluna) == ordem.end())
             ordem.push_back(c.coluna);
     }
-    // Colunas descobertas automaticamente na resposta da API: toda chave do
-    // registro que nao seja reservada vira coluna (tipo inferido dos dados).
+    // Colunas descobertas automatically in response of API: toda key of
+    // account book that not seja reservada vira column (type inferido of date).
     for (const auto& r : amostra) {
         for (const auto& kv : r) {
             if (coluna_reservada(kv.first)) continue;
@@ -921,7 +1056,7 @@ static void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& a
             prim = false;
         }
         sql += ", created_at TEXT";
-        // chave de deduplicacao
+        // key of deduplicacao
         std::vector<std::string> chave;
         if (!ds.chave_data.empty()) chave.push_back(ds.chave_data);
         if (ds.salvar_hora && !ds.chave_hora.empty() && ds.chave_hora != ds.chave_data)
@@ -930,8 +1065,8 @@ static void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& a
         chave.push_back("longitude");
         sql += ",\n  UNIQUE (" + juntar(chave, ", ") + ")\n)";
         executar_sql(conn, sql);
-        log("[DB] Tabela criada: " + ds.db + "." + ds.tabela + " (" +
-            std::to_string(ordem.size()) + " colunas)");
+        log("[DB] Table created: " + ds.db + "." + ds.tabela + " (" +
+            std::to_string(ordem.size()) + " columns)");
     } else {
         for (const auto& col : ordem) {
             if (std::find(existentes.begin(), existentes.end(), col) == existentes.end()) {
@@ -940,7 +1075,7 @@ static void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& a
                 if (it != tipo_decl.end()) decl = it->second;
                 executar_sql(conn, "ALTER TABLE \"" + ds.tabela + "\" ADD COLUMN " + col +
                                        " " + inferir_tipo_coluna(decl, amostra, col));
-                log("[DB] Coluna adicionada: " + ds.tabela + "." + col);
+                log("[DB] Column added: " + ds.tabela + "." + col);
             }
         }
         if (std::find(existentes.begin(), existentes.end(), "created_at") ==
@@ -952,25 +1087,25 @@ static void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& a
                            "_loc ON \"" + ds.tabela + "\"(latitude, longitude, \"" +
                            (ds.chave_data.empty() ? "latitude" : ds.chave_data) + "\")");
     if (!ds.chave_data.empty())
-        executar_sql(conn, "CREATE INDEX IF NOT EXISTS idx_" + ds.tabela + "_data ON \"" +
+        executar_sql(conn, "CREATE INDEX IF NOT EXISTS idx_" + ds.tabela + "_date ON \"" +
                                ds.tabela + "\"(\"" + ds.chave_data + "\")");
 }
 
 static void criar_tabelas_datasets() {
-    // Tabelas genericas ([dataset:*]): cria (ou evolui) cada tabela no seu
-    // .db e cria arquivos vazios antecipadamente para que multiplos .db
-    // existam mesmo antes do primeiro download.
+    // Tabelas genericas ([dataset:*]): cria (or evolui) each table in his
+    // .db and cria files vazios antecipadamente to that multiplos .db
+    // existam same before of first download.
     for (const auto& ds : CFG.datasets) {
         try {
             std::vector<Registro> vazio;
             garantir_tabela(ds, vazio);
         } catch (const std::exception& e) {
-            log(std::string("[AVISO] ") + ds.db + "." + ds.tabela + ": " + e.what());
+            log(std::string("[WARNING] ") + ds.db + "." + ds.tabela + ": " + e.what());
         }
     }
 }
 
-// Registros existentes no banco (carregados uma unica vez)
+// Registros existentes in database (carregados the unica occasion)
 using Chave = std::pair<double, double>;
 using ConjuntoDatas = std::set<std::string>;
 
@@ -982,7 +1117,7 @@ static const ConjuntoDatas& datas_vazias() {
     return vazio;
 }
 
-// Equivalente a _get_valor() do download.py
+// Equivalent the _get_valor() of download.py
 static Valor pegar(const json& dados, const std::string& chave, size_t i) {
     if (!dados.is_object()) return Valor{};
     auto it = dados.find(chave);
@@ -996,15 +1131,17 @@ static Valor pegar(const json& dados, const std::string& chave, size_t i) {
 
 static std::optional<json> baixar_com_retry(const std::string& url,
                                             const std::map<std::string, std::string>& params,
-                                            int max_tentativas);
+                                            int max_tentativas, double custo,
+                                            const std::string& chave_api);
 
-// Parse generico: bloco JSON -> registros. COLUNAS DESCOBERTAS
-// AUTOMATICAMENTE: toda chave array do bloco (exceto "time") vira coluna com
-// nome normalizado; o tipo e inferido ao criar/evoluir a tabela. Overrides
-// opcionais do .ini (coluna.*) apenas renomeiam/tipam.
+// Parse general: block JSON -> registros. COLUNAS DESCOBERTAS
+// AUTOMATICALLY: toda key array of block (besides "team") vira column with
+// name normalizado; the type and inferido at criar/evoluir the table. Overrides
+// opcionais of .ini (column.*) only renomeiam/tipam.
 static std::vector<Registro> parse_dataset(const json& bloco_json, const json& raiz,
                                            double lat, double lon, const DatasetCfg& ds,
-                                           const std::set<std::string>* filtro) {
+                                           const std::set<std::string>* filtro,
+                                           bool forcar_hora = false) {
     if (!bloco_json.is_object()) return {};
     std::vector<std::string> times;
     auto it_t = bloco_json.find("time");
@@ -1013,7 +1150,7 @@ static std::vector<Registro> parse_dataset(const json& bloco_json, const json& r
             if (t.is_string()) times.push_back(t.get<std::string>());
         }
     }
-    // Overrides opcionais: variavel da API -> coluna renomeada/tipada
+    // Overrides opcionais: variable of API -> column renomeada/tipada
     std::map<std::string, ColunaCfg> overrides;
     for (const auto& c : ds.colunas) overrides[c.variavel_api] = c;
     std::vector<Registro> regs;
@@ -1027,7 +1164,11 @@ static std::vector<Registro> parse_dataset(const json& bloco_json, const json& r
         reg["latitude"] = lat;
         reg["longitude"] = lon;
         if (!ds.chave_data.empty()) reg[ds.chave_data] = data;
-        if (ds.salvar_hora && !ds.chave_hora.empty()) reg[ds.chave_hora] = t;
+        // Polen redirecionado vira hourly: grava "hora" mesmo que o dataset
+        // esteja marcado como dia no .ini (senao 24 linhas/dia colapsam numa
+        // so no UPSERT e quase tudo se perde).
+        if ((ds.salvar_hora || forcar_hora) && !ds.chave_hora.empty())
+            reg[ds.chave_hora] = t;
         if (ds.salvar_timezone) {
             auto itz = raiz.find("timezone");
             if (itz != raiz.end() && itz->is_string())
@@ -1051,18 +1192,45 @@ static std::vector<Registro> parse_dataset(const json& bloco_json, const json& r
 
 static std::string url_do_dataset(const DatasetCfg& ds, const std::string& data) {
     // url_passado p/ datas < hoje (archive), url_futuro p/ datas >= hoje.
+    // O archive aceita ate ~hoje mas o forecast REJEITA start_date antigo
+    // com 400 — por isso a fronteira precisa ser exata e os blocos nunca
+    // podem misturar passado+futuro. Datas "YYYY-MM-DD" zero-padded
+    // comparam lexicograficamente = ordem cronologica, sem parsear.
     if (!ds.url_passado.empty() || !ds.url_futuro.empty()) {
-        bool futuro = false;
-        try {
-            para_data(data);
-            futuro = !(data < hoje());
-        } catch (...) {
-            futuro = true;
-        }
+        bool futuro = !(data < hoje());
         if (!futuro && !ds.url_passado.empty()) return ds.url_passado;
         if (futuro && !ds.url_futuro.empty()) return ds.url_futuro;
     }
     return ds.url;
+}
+
+// Rotacao round-robin between varias URLs of same country ("url = the | b"):
+// espalha the job between endpoints and pula the that estao in cooldown of 429.
+// If all estiverem resfriados, expectation the under age cooldown and tenta of new.
+static std::string escolher_url(const std::string& lista) {
+    auto cands = dividir(lista, '|');
+    cands.erase(std::remove_if(cands.begin(), cands.end(), [](const std::string& s) {
+        return s.empty();
+    }), cands.end());
+    if (cands.empty()) return lista;
+    if (cands.size() == 1) return cands.front();
+    static std::atomic<unsigned> g_rr_url{0};
+    for (;;) {
+        double espera = -1.0;
+        {
+            std::lock_guard<std::mutex> lk(g_rate_mtx);
+            auto agora = std::chrono::steady_clock::now();
+            unsigned base = g_rr_url.fetch_add(1);
+            for (size_t k = 0; k < cands.size(); ++k) {
+                const std::string& u = cands[(base + k) % cands.size()];
+                auto it = g_ep_cooldown.find(u);
+                if (it == g_ep_cooldown.end() || it->second <= agora) return u;
+                double rem = std::chrono::duration<double>(it->second - agora).count();
+                if (espera < 0.0 || rem < espera) espera = rem;
+            }
+        }
+        dormir((espera > 0.0 ? espera : 0.5) + 0.1);
+    }
 }
 
 static std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
@@ -1075,22 +1243,70 @@ static std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
     if (alvo.empty()) return {};
     std::sort(alvo.begin(), alvo.end());
     std::vector<Registro> todos;
-    // Agrupa por URL (passado x futuro) em blocos de chunk_dias.
+    // Agrupa by URL (former x future) in blocos of chunk_dias.
     size_t i = 0;
     while (i < alvo.size()) {
-        std::string url = url_do_dataset(ds, alvo[i]);
+        std::string lista = url_do_dataset(ds, alvo[i]);
         size_t j = i;
-        while (j < alvo.size() && url_do_dataset(ds, alvo[j]) == url &&
+        while (j < alvo.size() && url_do_dataset(ds, alvo[j]) == lista &&
                (j - i) < static_cast<size_t>(CFG.chunk_dias))
             ++j;
         std::vector<std::string> grupo(alvo.begin() + i, alvo.begin() + j);
+        std::string bloco_req = ds.bloco;
+        std::string chave_req = ds.params_chave;
         std::vector<std::string> vars = ds.vars;
-        if (url == ds.url_passado && !ds.url_passado.empty() && !ds.vars_excluir.empty()) {
+        // POLEN: o endpoint dedicado api.open-meteo.com/v1/pollen NAO existe
+        // (retorna 404 "Not Found"). Polen mora no air-quality-api com bloco
+        // hourly e nomes sem sufixo _mean (alder_pollen, nao alder_pollen_mean).
+        bool eh_polen = (lista.find("pollen") != std::string::npos);
+        if (eh_polen) {
+            lista = "https://air-quality-api.open-meteo.com/v1/air-quality";
+            bloco_req = "hourly";
+            chave_req = "hourly";
+            for (auto& v : vars) {
+                const std::string suf = "_mean";
+                if (v.size() > suf.size() &&
+                    v.compare(v.size() - suf.size(), suf.size(), suf) == 0)
+                    v = v.substr(0, v.size() - suf.size());
+            }
+        }
+        if (lista == ds.url_passado && !ds.url_passado.empty() && !ds.vars_excluir.empty()) {
             vars.erase(std::remove_if(vars.begin(), vars.end(),
                                       [&](const std::string& v) {
                                           return ds.vars_excluir.count(v);
                                       }),
                        vars.end());
+        }
+        // Cost of request in unidades fracionarias of chamada (FAQ
+        // Open-Meteo): max(1, vars/10, dias*1.5/14) - ex.: 30 dias x 24
+        // vars ~ 3.2 calls. AND the that the budget min/hora/dia desconta.
+        double custo = 1.0;
+        if (!vars.empty())
+            custo = std::max(custo,
+                             static_cast<double>(vars.size()) / CFG.custo_vars_ref);
+        try {
+            Data da = para_data(grupo.front());
+            Data db = para_data(grupo.back());
+            long d1 = dias_de_civil(da.ano, da.mes, da.dia);
+            long d2 = dias_de_civil(db.ano, db.mes, db.dia);
+            custo = std::max(custo, (d2 - d1 + 1) * CFG.custo_dias_fator /
+                                        CFG.custo_dias_ref);
+        } catch (...) {
+            custo = std::max(custo, static_cast<double>(grupo.size()) *
+                                        CFG.custo_dias_fator / CFG.custo_dias_ref);
+        }
+        // Key of API rotacionada: each key tem budget decent, now
+        // "api_keys = k1 | k2" fold the quota disponivel.
+        std::string chave_api;
+        if (!ds.api_keys.empty()) {
+            auto chaves = dividir(ds.api_keys, '|');
+            chaves.erase(std::remove_if(chaves.begin(), chaves.end(), [](const std::string& s) {
+                return s.empty();
+            }), chaves.end());
+            if (!chaves.empty()) {
+                static std::atomic<unsigned> g_rr_chave{0};
+                chave_api = chaves[g_rr_chave.fetch_add(1) % chaves.size()];
+            }
         }
         std::map<std::string, std::string> params = {
             {"latitude", num_str(lat)},
@@ -1099,11 +1315,14 @@ static std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
             {"end_date", grupo.back()},
             {"timezone", CFG.fuso_horario},
         };
-        if (!vars.empty()) params[ds.params_chave] = juntar(vars, ",");
-        auto dados = baixar_com_retry(url, params, CFG.max_retries);
-        if (dados && dados->contains(ds.bloco) && (*dados)[ds.bloco].is_object()) {
+        if (!vars.empty()) params[chave_req] = juntar(vars, ",");
+        if (!chave_api.empty()) params[CFG.api_key_param] = chave_api;
+        auto dados = baixar_com_retry(escolher_url(lista), params, CFG.max_retries,
+                                      custo, chave_api);
+        if (dados && dados->contains(bloco_req) && (*dados)[bloco_req].is_object()) {
             std::set<std::string> filtro(grupo.begin(), grupo.end());
-            auto regs = parse_dataset((*dados)[ds.bloco], *dados, lat, lon, ds, &filtro);
+            auto regs = parse_dataset((*dados)[bloco_req], *dados, lat, lon, ds, &filtro,
+                                    eh_polen);
             todos.insert(todos.end(), std::make_move_iterator(regs.begin()),
                          std::make_move_iterator(regs.end()));
         }
@@ -1115,10 +1334,10 @@ static std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
 // HTTP (libcurl) + retry/backoff
 struct RespostaHttp {
     bool erro_rede = false; // timeout/conexao (equivale Timeout/ConnectionError)
-    std::string erro_mensagem; // descricao do erro de rede
-    long status = 0; // HTTP status (0 se erro de rede)
+    std::string erro_mensagem; // descricao of error of network
+    long status = 0; // HTTP status (0 if error of network)
     std::string corpo;
-    double retry_after = -1.0; // header Retry-After, se presente
+    double retry_after = -1.0; // header Retry-After, if gift
 };
 
 static CURL* curl_da_thread() {
@@ -1173,7 +1392,7 @@ static RespostaHttp http_get(const std::string& url) {
     CURL* curl = curl_da_thread();
     if (!curl) {
         r.erro_rede = true;
-        r.erro_mensagem = "falha ao iniciar curl";
+        r.erro_mensagem = "failure at start curl";
         return r;
     }
     curl_easy_reset(curl);
@@ -1186,7 +1405,7 @@ static RespostaHttp http_get(const std::string& url) {
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""); // gzip automatico
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, ""); // gzip automatic
 
     CURLcode rc = curl_easy_perform(curl);
     if (rc != CURLE_OK) {
@@ -1203,11 +1422,13 @@ static RespostaHttp http_get(const std::string& url) {
 
 static std::optional<json> baixar_com_retry(const std::string& url,
                                             const std::map<std::string, std::string>& params,
-                                            int max_tentativas) {
+                                            int max_tentativas, double custo,
+                                            const std::string& chave_api) {
     std::string url_completa = montar_url(url, params);
+    // Bevy of budget: key of API (quota propria) or "anonymous" (quota of IP)
+    std::string grupo = chave_api.empty() ? std::string("anonymous") : chave_api;
     for (int tentativa = 1; tentativa <= max_tentativas; ++tentativa) {
-        esperar_cooldown_global();
-        esperar_rate_limit();
+        esperar_envio(grupo, custo); // cooldown global + budget + slot
 
         RespostaHttp r = http_get(url_completa);
 
@@ -1217,14 +1438,14 @@ static std::optional<json> baixar_com_retry(const std::string& url,
                 return json::parse(r.corpo);
             } catch (const std::exception& e) {
                 if (tentativa == max_tentativas) {
-                    log("  [ERRO] Resposta sem JSON valido apos " +
-                        std::to_string(max_tentativas) + " tentativas: " + e.what());
+                    log("  [ERROR] Response without JSON valid after " +
+                        std::to_string(max_tentativas) + " attempts: " + e.what());
                     return std::nullopt;
                 }
                 double espera = backoff_exponencial(tentativa);
                 char buf[200];
                 std::snprintf(buf, sizeof(buf),
-                              "  [RETRY %d/%d] Resposta sem JSON valido. Aguardando %.1fs...",
+                              "  [RETRY %d/%d] Response without JSON valid. Waiting %.1fs...",
                               tentativa, max_tentativas, espera);
                 log(buf);
                 dormir(espera);
@@ -1233,55 +1454,73 @@ static std::optional<json> baixar_com_retry(const std::string& url,
         }
 
         if (!r.erro_rede && r.status == 429) {
-            reduzir_taxa_429();
-
-            // Prioridade: Retry-After do servidor > backoff > espera minima
-            double espera = CFG.espera_min_429;
-            if (r.retry_after > 0) {
+            // THE body of error diz which limit estourou (ex.: "Daily API
+            // request limit exceeded") - quota exige break longa, not retry
+            // fast with backoff crescente.
+            std::string corpo = r.corpo.substr(0, 1000);
+            std::transform(corpo.begin(), corpo.end(), corpo.begin(),
+                           [](unsigned char c) {
+                               return static_cast<char>(std::tolower(c));
+                           });
+            bool quota = corpo.find("daily") != std::string::npos ||
+                         corpo.find("per day") != std::string::npos ||
+                         corpo.find("hour") != std::string::npos ||
+                         corpo.find("minute") != std::string::npos ||
+                         corpo.find("month") != std::string::npos;
+            // Prioridade: Retry-After of server > break of quota > backoff
+            double espera;
+            if (r.retry_after > 0)
                 espera = r.retry_after;
-            } else {
-                espera = backoff_exponencial(tentativa);
-            }
-
-            // Se o cooldown global ja esta ativo, espera o cooldown (nao espera dobrado)
-            {
-                std::lock_guard<std::mutex> lk(g_rate_mtx);
-                if (g_cooldown_ativo) {
-                    double restante = g_cooldown_atual - std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - g_cooldown_inicio).count();
-                    if (restante > espera) espera = restante;
-                }
-            }
+            else if (quota)
+                espera = CFG.cooldown_quota;
+            else
+                espera = std::max(CFG.espera_min_429, backoff_exponencial(tentativa));
+            // Cooldown GLOBAL (all the threads param juntas, log alone) +
+            // cooldown of endpoint p/ rotacao of URLs. Not dorme here: the
+            // proxima bend expectation the cooldown compartilhado (evita expectation
+            // dupla and the hurricane of retries by thread).
+            tratar_429(espera, quota ? "quota of API exceeded" : "HTTP 429", url);
             if (tentativa == max_tentativas) {
-                log("  [ERRO] 429 persistente apos " + std::to_string(max_tentativas) + " tentativas");
+                log("  [ERROR] 429 persistent after " +
+                    std::to_string(max_tentativas) + " attempts");
                 return std::nullopt;
             }
-            char buf[200];
-            std::snprintf(buf, sizeof(buf), "  [RETRY %d/%d] HTTP 429. Aguardando %.1fs...",
-                          tentativa, max_tentativas, espera);
+            char buf[220];
+            std::snprintf(buf, sizeof(buf),
+                          "  [RETRY %d/%d] HTTP 429%s. Break global of %.0fs...",
+                          tentativa, max_tentativas, quota ? " (quota)" : "",
+                          espera);
             log(buf);
-            dormir(espera);
         } else if (!r.erro_rede) {
+            // 400/404 = pedido invalido (var errada, endpoint morto, range
+            // fora do permitido): repetir nao adianta, falha rapido e mostra
+            // o motivo + URL para diagnostico.
+            if (r.status == 400 || r.status == 404) {
+                std::string motivo = r.corpo.substr(0, 300);
+                log("  [ERROR] HTTP " + std::to_string(r.status) +
+                    " (sem retry): " + motivo + " :: " + url_completa);
+                return std::nullopt;
+            }
             if (tentativa == max_tentativas) {
-                log("  [ERRO] Falha apos " + std::to_string(max_tentativas) +
-                    " tentativas: HTTP " + std::to_string(r.status));
+                log("  [ERROR] Failure after " + std::to_string(max_tentativas) +
+                    " attempts: HTTP " + std::to_string(r.status));
                 return std::nullopt;
             }
             double espera = backoff_exponencial(tentativa);
             char buf[200];
-            std::snprintf(buf, sizeof(buf), "  [RETRY %d/%d] HTTP %ld. Aguardando %.1fs...",
+            std::snprintf(buf, sizeof(buf), "  [RETRY %d/%d] HTTP %ld. Waiting %.1fs...",
                           tentativa, max_tentativas, r.status, espera);
             log(buf);
             dormir(espera);
         } else {
             if (tentativa == max_tentativas) {
-                log("  [ERRO] Falha apos " + std::to_string(max_tentativas) +
-                    " tentativas: " + r.erro_mensagem);
+                log("  [ERROR] Failure after " + std::to_string(max_tentativas) +
+                    " attempts: " + r.erro_mensagem);
                 return std::nullopt;
             }
             double espera = backoff_exponencial(tentativa);
             char buf[256];
-            std::snprintf(buf, sizeof(buf), "  [RETRY %d/%d] %s. Aguardando %.1fs...",
+            std::snprintf(buf, sizeof(buf), "  [RETRY %d/%d] %s. Waiting %.1fs...",
                           tentativa, max_tentativas, r.erro_mensagem.c_str(), espera);
             log(buf);
             dormir(espera);
@@ -1290,15 +1529,15 @@ static std::optional<json> baixar_com_retry(const std::string& url,
     return std::nullopt;
 }
 
-// Salvamento generico: garante a tabela (cria sozinha), descobre as colunas
-// reais do banco e grava com UPSERT por chave (merge entre APIs).
+// Salvamento general: garante the table (cria sozinha), descobre the colunas
+// reais of database and grava with UPSERT by key (merge between APIs).
 static void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& registros) {
     if (registros.empty()) return;
     garantir_tabela(ds, registros);
     sqlite3* conn = get_connection_para(ds.db);
     std::vector<std::string> campos = colunas_da_tabela(conn, ds.tabela);
     campos.erase(std::remove(campos.begin(), campos.end(), "created_at"), campos.end());
-    // mantem ordem canonica: data,hora,lat,lon primeiro (nomes configurados)
+    // mantem order canonica: data,hora,lat,lon first (nomes configurados)
     std::vector<std::string> pref;
     auto pref_add = [&](const std::string& c) {
         if (c.empty() || std::find(pref.begin(), pref.end(), c) != pref.end()) return;
@@ -1325,14 +1564,14 @@ static void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& re
     std::vector<std::string> marc(campos.size() + 1, "?");
     std::string sql = "INSERT INTO \"" + ds.tabela + "\" (" + juntar(campos, ",") +
                       ", created_at) VALUES (" + juntar(marc, ",") + ")";
-    // UPSERT: atualiza so as colunas nao-chave (merge entre APIs/tabelas iguais)
+    // UPSERT: atualiza exclusively the colunas nao-chave (merge between APIs/tabelas iguais)
     std::vector<std::string> upd;
     for (const auto& c : campos) {
         if (std::find(chave.begin(), chave.end(), c) == chave.end())
             upd.push_back("\"" + c + "\"=excluded.\"" + c + "\"");
     }
     if (!upd.empty() && !chave.empty())
-        sql += " ON CONFLICT(" + juntar(chave, ",") + ") DO UPDATE SET " + juntar(upd, ",");
+        sql += " ON CONFLICT(\"" + juntar(chave, "\",\"") + "\") DO UPDATE SET " + juntar(upd, ",");
     else
         sql += " ON CONFLICT DO NOTHING";
 
@@ -1362,7 +1601,7 @@ static void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& re
         }
         sqlite3_bind_text(stmt, idx, agora.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(stmt) != SQLITE_DONE)
-            log("[ERRO] " + ds.tabela + ": " + sqlite3_errmsg(conn));
+            log("[ERROR] " + ds.tabela + ": " + sqlite3_errmsg(conn));
         sqlite3_reset(stmt);
         sqlite3_clear_bindings(stmt);
         if (++lote >= static_cast<size_t>(CFG.max_sql_dates_por_lote)) {
@@ -1375,7 +1614,7 @@ static void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& re
     sqlite3_finalize(stmt);
 }
 
-// Orquestracao generica: bloco (dataset, datas, coord) -> fila -> gravar.
+// Orquestracao generica: block (dataset, datas, coord) -> file -> engrave.
 struct ResultadoGenerico {
     size_t dataset_idx = 0;
     double lat = 0.0, lon = 0.0;
@@ -1460,7 +1699,7 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
                                std::map<size_t, long long>& baixados,
                                std::map<size_t, long long>& pulados) {
     const DatasetCfg& ds = CFG.datasets[r.dataset_idx];
-    // dias pedidos sem retorno = ja existentes ou fora do intervalo da API
+    // dias pedidos without retorno = already existentes or abroad of interval of API
     long long dias_retornados = 0;
     {
         std::set<std::string> dias;
@@ -1472,8 +1711,7 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
         }
         dias_retornados = static_cast<long long>(dias.size());
     }
-    pulados[r.dataset_idx] +=
-        static_cast<long long>(r.datas_pedidas.size()) - dias_retornados;
+    pulados[r.dataset_idx] += static_cast<long long>(r.datas_pedidas.size()) - dias_retornados;
     if (r.registros.empty()) return;
     {
         std::lock_guard<std::mutex> lk(g_write_mtx);
@@ -1492,7 +1730,7 @@ static void processar_generico(const ResultadoGenerico& r, ExistentesGen& existe
     baixados[r.dataset_idx] += dias_retornados;
 }
 
-// Fila limitada (download -> processamento)
+// File limitada (download -> processamento)
 template <typename T>
 class Fila {
 public:
@@ -1507,7 +1745,7 @@ public:
         cv_vazia_.notify_one();
     }
 
-    // Retorna false quando a fila foi fechada e esvaziada
+    // Retorna false when the file foi fechada and esvaziada
     bool get(T& saida) {
         std::unique_lock<std::mutex> lk(m_);
         cv_vazia_.wait(lk, [&] {
@@ -1572,10 +1810,10 @@ static int executar_generico(const std::vector<std::string>& datas, double tempo
             }
         }
     }
-    std::cout << "[DB] Tarefas: " << tarefas.size() << " blocos, " << falt
-              << " dias x coord faltantes.\n";
+    std::cout << "[DB] Tasks: " << tarefas.size() << " blocks, " << falt
+              << " missing day x coord.\n";
     if (tarefas.empty()) {
-        std::cout << "[DB] Nada a fazer.\n";
+        std::cout << "[DB] Nothing to do.\n";
         return 0;
     }
     std::map<size_t, long long> baixados, pulados;
@@ -1585,7 +1823,7 @@ static int executar_generico(const std::vector<std::string>& datas, double tempo
     Fila<ResultadoGenerico> fila((size_t)CFG.download_workers * 2);
     std::atomic<size_t> idx_t{0};
     std::atomic<long long> feitas{0};
-    std::cout << "\nIniciando " << total << " tarefas...\n\n";
+    std::cout << "\nStarting " << total << " tasks...\n\n";
     std::vector<std::thread> consumidores;
     for (int i = 0; i < CFG.process_workers; ++i) {
         consumidores.emplace_back([&] {
@@ -1608,7 +1846,7 @@ static int executar_generico(const std::vector<std::string>& datas, double tempo
                     }
                 }
             } catch (const std::exception& e) {
-                log(std::string("[ERRO] Consumidor: ") + e.what());
+                log(std::string("[ERROR] Consumer: ") + e.what());
             }
         });
     }
@@ -1625,7 +1863,7 @@ static int executar_generico(const std::vector<std::string>& datas, double tempo
                     if (feitas.fetch_add(1) + 1 >= total) fila.close();
                 }
             } catch (const std::exception& e) {
-                log(std::string("[ERRO] Produtor: ") + e.what());
+                log(std::string("[ERROR] Produtor: ") + e.what());
                 if (feitas.fetch_add(1) + 1 >= total) fila.close();
             }
         });
@@ -1636,13 +1874,13 @@ static int executar_generico(const std::vector<std::string>& datas, double tempo
     std::cout << "\n\n============================================================\n"
               << "DOWNLOAD CONCLUIDO!\n"
               << "============================================================\n"
-              << "Tempo total: " << tt << "s\n"
-              << "Tempo carregamento DB: " << tempo_load << "s\n"
-              << "Blocos: " << concluidos.load() << "/" << total << "\n--- RESUMO ---\n";
+              << "Team total: " << tt << "s\n"
+              << "Team burden DB: " << tempo_load << "s\n"
+              << "Blocos: " << concluidos.load() << "/" << total << "\n--- ABRIDGEMENT ---\n";
     for (size_t di = 0; di < CFG.datasets.size(); ++di) {
         std::cout << CFG.datasets[di].id << " (" << CFG.datasets[di].db << "."
                   << CFG.datasets[di].tabela << "): " << baixados[di]
-                  << " dias baixados | " << pulados[di] << " ja existentes\n";
+                  << " dias baixados | " << pulados[di] << " already existentes\n";
     }
     std::cout << "============================================================\n";
     return 0;
@@ -1652,9 +1890,9 @@ int main(int argc, char** argv) {
     std::string caminho_ini = argc > 1 ? argv[1] : "download.ini";
     carregar_config(caminho_ini);
     if (CFG.datasets.empty()) {
-        std::cerr << "[ERRO] Nenhum [dataset:*] definido em " << caminho_ini
-                  << ". O formato antigo (daily_params/hourly_params/...) nao e mais "
-                     "suportado; declare ao menos uma secao [dataset:<id>].\n";
+        std::cerr << "[ERROR] None [dataset:*] definido in " << caminho_ini
+                  << ". THE formato old (daily_params/hourly_params/...) not and more "
+                     "suportado; declare at less a section [dataset:<id>].\n";
         return 1;
     }
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -1663,21 +1901,21 @@ int main(int argc, char** argv) {
     try {
         std::vector<std::string> datas = expandir_periodo(CFG.periodo_inicio, CFG.periodo_fim);
         if (datas.empty()) {
-            std::cerr << "[ERRO] Periodo invalido (inicio > fim) em " << caminho_ini << "\n";
+            std::cerr << "[ERROR] Period disabled (start > end) in " << caminho_ini << "\n";
             curl_global_cleanup();
             return 1;
         }
 
         std::cout << "============================================================\n"
-                  << "DOWNLOAD DE DADOS CLIMATICOS (generico)\n"
+                  << "DOWNLOAD OF DATA CLIMATICOS (generico)\n"
                   << "============================================================\n"
                   << "Configuracao: " << caminho_ini << "\n"
-                  << "Fuso horario: " << CFG.fuso_horario << "\n"
-                  << "Banco de dados: " << CFG.db_path << "\n";
+                  << "Spindle schedule: " << CFG.fuso_horario << "\n"
+                  << "Database of date: " << CFG.db_path << "\n";
         {
             std::set<std::string> dbs;
             for (const auto& ds : CFG.datasets) dbs.insert(ds.db);
-            std::cout << "Bancos destino (" << dbs.size() << "): ";
+            std::cout << "Bancos target (" << dbs.size() << "): ";
             bool p = false;
             for (const auto& d : dbs) {
                 if (p) std::cout << ", ";
@@ -1696,11 +1934,10 @@ int main(int argc, char** argv) {
 
         criar_tabelas_datasets();
 
-        std::cout << "\n[DB] Carregando registros existentes...\n";
+        std::cout << "\n[DB] Loading registros existentes...\n";
         auto t0 = std::chrono::steady_clock::now();
         ExistentesGen existentes = carregar_existentes_generico(datas);
-        double tload =
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        double tload = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         for (size_t di = 0; di < CFG.datasets.size(); ++di) {
             long long tot = 0;
             auto it = existentes.find(di);

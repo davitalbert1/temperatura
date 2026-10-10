@@ -21,6 +21,9 @@ echo Compilando download.cpp com:
 echo    %GXX%
 echo.
 
+for %%I in ("%GXX%") do set "GXX_DIR=%%~dpI"
+set "PATH=%GXX_DIR%;%PATH%"
+
 "%GXX%" -std=c++17 -O2 -Wall -o "%~dp0download.exe" "%~dp0download.cpp" -lcurl -lsqlite3 -pthread
 
 if errorlevel 1 (

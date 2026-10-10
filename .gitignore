@@ -6,3 +6,8 @@ clima.db-wal
 *.txt
 !CMakeLists.txt
 build/
+.env
+dados_era5/
+*.part.grib
+*.part.nc
+*.exe

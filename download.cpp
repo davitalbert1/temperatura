@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -34,6 +35,9 @@
 
 using json = nlohmann::json;
 
+// Map para variáveis de ambiente carregadas do .env
+static std::map<std::string, std::string> g_env_map;
+
 // Utilidades of text / files .ini
 static std::string cortar(const std::string& s) {
     const char* espacos = " \t\r\n";
@@ -46,6 +50,40 @@ static std::string cortar(const std::string& s) {
 static std::string sem_comentario(const std::string& s) {
     size_t p = s.find_first_of(";#");
     return p == std::string::npos ? s : s.substr(0, p);
+}
+
+static void carregar_env(const std::string& caminho = ".env") {
+    std::ifstream arq(caminho);
+    if (!arq) return;
+    std::string linha;
+    while (std::getline(arq, linha)) {
+        linha = cortar(sem_comentario(linha));
+        if (linha.empty()) continue;
+        size_t pos = linha.find('=');
+        if (pos == std::string::npos) continue;
+        std::string k = cortar(linha.substr(0, pos));
+        std::string v = cortar(linha.substr(pos + 1));
+        if (!v.empty() && (v.front() == '"' || v.front() == '\'') && v.front() == v.back()) {
+            v = v.substr(1, v.size() - 2);
+        }
+        if (!k.empty()) {
+            g_env_map[k] = v;
+#ifdef _WIN32
+            _putenv_s(k.c_str(), v.c_str());
+#else
+            setenv(k.c_str(), v.c_str(), 0);
+#endif
+        }
+    }
+}
+
+static std::string obter_env_ou_config(const char* nome_env, const std::string& valor_cfg, const std::string& padrao = "") {
+    if (!valor_cfg.empty()) return valor_cfg;
+    const char* env_v = std::getenv(nome_env);
+    if (env_v && *env_v) return std::string(env_v);
+    auto it = g_env_map.find(nome_env);
+    if (it != g_env_map.end() && !it->second.empty()) return it->second;
+    return padrao;
 }
 
 static std::vector<std::string> dividir(const std::string& s, char sep) {
@@ -273,10 +311,10 @@ static std::string normalizar_tipo(const std::string& t) {
     std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
-    if (v.empty() || v == "auto") return "auto";
+    if (v.empty() || v == "auto") return "car";
     if (v == "int" || v == "integer" || v == "bool" || v == "boolean") return "integer";
     if (v == "real" || v == "float" || v == "double" || v == "number" || v == "numeric")
-        return "real";
+        return "actual";
     return "text";
 }
 
@@ -299,7 +337,7 @@ static bool separar_def_coluna(const std::string& def, std::string& coluna,
     // dir pode creature "variavel:tipo"
     size_t dp = dir.find(':');
     std::string var = cortar(dp == std::string::npos ? dir : dir.substr(0, dp));
-    std::string tp = dp == std::string::npos ? "auto" : cortar(dir.substr(dp + 1));
+    std::string tp = dp == std::string::npos ? "car" : cortar(dir.substr(dp + 1));
     if (var.empty()) var = esq;
     coluna = normalizar_nome(esq);
     variavel_api = var.empty() ? coluna : var;
@@ -337,6 +375,19 @@ struct DatasetCfg {
     std::string chave_data = "data";    // column of date ("" = without column of date)
     std::string chave_hora = "hour";    // column of hour ("" = without column of hour)
     std::string api_keys;               // chaves "k1 | k2" (empty = herda [general] api_keys)
+
+    // Configurações para salvamento em arquivos (ex: ERA5 / CDS API)
+    std::string tipo_saida = "db";      // "db" (salva no sqlite) ou "arquivo" (salva em pasta)
+    std::string pasta_saida = "dados_era5"; // pasta de destino para arquivos
+    std::string extensao = "grib";      // extensao do arquivo (grib, nc, etc)
+    std::string dataset_api = "reanalysis-era5-single-levels"; // nome do dataset CDS
+    std::string product_type = "reanalysis";
+    std::string data_format = "grib";
+    std::string download_format = "unarchived";
+    std::vector<std::string> horarios = {"00:00", "12:00"};
+    int ano_inicial = 1940;
+    int dias_atraso = 7;
+    std::string modo_api = "auto";
 };
 
 struct Config {
@@ -416,8 +467,35 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.url_passado = cortar(ini.obter_ou(secao, "url_passado"));
         d.url_futuro = cortar(ini.obter_ou(secao, "url_futuro"));
         d.api_keys = cortar(ini.obter_ou(secao, "api_keys"));
+
+        // Campos para dataset do tipo arquivo / ERA5
+        d.tipo_saida = cortar(ini.obter_ou(secao, "tipo_saida"));
+        if (d.tipo_saida.empty()) d.tipo_saida = cortar(ini.obter_ou(secao, "output_type"));
+        if (d.tipo_saida.empty()) {
+            std::string temp_val;
+            if (ini.obter(secao, "pasta_saida", temp_val) || ini.obter(secao, "dataset_api", temp_val) || secao.find("era5") != std::string::npos) {
+                d.tipo_saida = "arquivo";
+            } else {
+                d.tipo_saida = "db";
+            }
+        }
+        d.pasta_saida = cortar(ini.obter_ou(secao, "pasta_saida", "dados_era5"));
+        d.extensao = cortar(ini.obter_ou(secao, "extensao", "grib"));
+        if (d.extensao.empty()) d.extensao = cortar(ini.obter_ou(secao, "format", "grib"));
+        d.dataset_api = cortar(ini.obter_ou(secao, "dataset_api", "reanalysis-era5-single-levels"));
+        d.product_type = cortar(ini.obter_ou(secao, "product_type", "reanalysis"));
+        d.data_format = cortar(ini.obter_ou(secao, "data_format", d.extensao));
+        d.download_format = cortar(ini.obter_ou(secao, "download_format", "unarchived"));
+        d.ano_inicial = para_int(ini.obter_ou(secao, "ano_inicial", "1940"), 1940);
+        d.dias_atraso = para_int(ini.obter_ou(secao, "dias_atraso", "7"), 7);
+
+        std::string hrs_str = ini.obter_ou(secao, "horarios");
+        if (!hrs_str.empty()) {
+            d.horarios = dividir(hrs_str, ',');
+        }
+
         // Aceita tanto "bloco" (pt, usado no download.ini) quanto "block" (en).
-        d.bloco = cortar(ini.obter_ou(secao, "bloco"));
+        d.bloco = cortar(ini.obter_ou(secao, "block"));
         if (d.bloco.empty()) d.bloco = cortar(ini.obter_ou(secao, "block", "daily"));
         if (d.bloco.empty()) d.bloco = "daily";
         d.params_chave = cortar(ini.obter_ou(secao, "params_chave", d.bloco));
@@ -446,7 +524,7 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
             for (const auto& kv : it_sec->second) {
                 // Aceita "coluna." (pt, doc do download.ini) e "column." (en).
                 std::string resto;
-                if (kv.first.rfind("coluna.", 0) == 0)
+                if (kv.first.rfind("column.", 0) == 0)
                     resto = kv.first.substr(7);
                 else if (kv.first.rfind("column.", 0) == 0)
                     resto = kv.first.substr(7);
@@ -496,11 +574,16 @@ static std::vector<DatasetCfg> montar_datasets_genericos(const Ini& ini) {
         d.chave_data = cd.empty() ? "" : normalizar_nome(cd);
         std::string ch = cortar(ini.obter_ou(secao, "chave_hora", "hour"));
         d.chave_hora = ch.empty() ? "" : normalizar_nome(ch);
+
+        if (d.tipo_saida == "arquivo" && d.url.empty()) {
+            d.url = obter_env_ou_config("CDSAPI_URL", "", "https://cds.climate.copernicus.eu/api");
+        }
+
         if (d.url.empty()) {
             std::cerr << "[WARNING] Dataset '" << d.id << "' ignorado (url vazia).\n";
             continue;
         }
-        if (d.vars.empty())
+        if (d.vars.empty() && d.tipo_saida != "arquivo")
             std::cerr << "[WARNING] Dataset '" << d.id
                       << "': without 'vars' - the API decide the that retorna.\n";
         out.push_back(std::move(d));
@@ -516,20 +599,20 @@ static void carregar_config(const std::string& caminho) {
         // Aceita tanto [geral] (pt) quanto [general] (en).
         if (ini.obter(sec, chave, v)) alvo = v;
         if (std::string(sec) == "geral" && ini.obter("general", chave, v)) alvo = v;
-        if (std::string(sec) == "general" && ini.obter("geral", chave, v)) alvo = v;
+        if (std::string(sec) == "general" && ini.obter("general", chave, v)) alvo = v;
     };
     auto le_int = [&](const char* chave, const char* env, int& alvo) {
-        if (ini.obter("geral", chave, v)) alvo = para_int(v, alvo);
+        if (ini.obter("general", chave, v)) alvo = para_int(v, alvo);
         if (ini.obter("general", chave, v)) alvo = para_int(v, alvo);
         if (env) alvo = env_int(env, alvo);
     };
     auto le_dbl = [&](const char* chave, const char* env, double& alvo) {
-        if (ini.obter("geral", chave, v)) alvo = para_double(v, alvo);
+        if (ini.obter("general", chave, v)) alvo = para_double(v, alvo);
         if (ini.obter("general", chave, v)) alvo = para_double(v, alvo);
         if (env) alvo = env_double(env, alvo);
     };
 
-    le_texto("geral", "db_path", CFG.db_path);
+    le_texto("general", "db_path", CFG.db_path);
     le_int("max_sql_dates_por_lote", nullptr, CFG.max_sql_dates_por_lote);
     le_int("download_workers", "OPENMETEO_DOWNLOAD_WORKERS", CFG.download_workers);
     le_int("process_workers", "OPENMETEO_PROCESS_WORKERS", CFG.process_workers);
@@ -557,7 +640,7 @@ static void carregar_config(const std::string& caminho) {
     le_texto("general", "periodo_inicio", CFG.periodo_inicio);
     le_texto("general", "periodo_fim", CFG.periodo_fim);
 
-    auto coord_linhas = ini.lista("coordenadas");
+    auto coord_linhas = ini.lista("coordinates");
     if (!coord_linhas.empty()) {
         std::vector<std::pair<double, double>> coords;
         for (const auto& l : coord_linhas) {
@@ -1022,7 +1105,7 @@ static void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& a
     if (ds.salvar_hora && !ds.chave_hora.empty() && ds.chave_hora != ds.chave_data)
         ordem.push_back(ds.chave_hora);
     ordem.push_back("latitude");
-    ordem.push_back("longitude");
+    ordem.push_back("length");
     for (const auto& c : ds.colunas) {
         if (std::find(ordem.begin(), ordem.end(), c.coluna) == ordem.end())
             ordem.push_back(c.coluna);
@@ -1048,7 +1131,7 @@ static void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& a
         std::string sql = "CREATE TABLE IF NOT EXISTS \"" + ds.tabela + "\" (\n";
         bool prim = true;
         for (const auto& col : ordem) {
-            std::string decl = "auto";
+            std::string decl = "car";
             auto it = tipo_decl.find(col);
             if (it != tipo_decl.end()) decl = it->second;
             sql += (prim ? "  " : ", ") + col + " " + inferir_tipo_coluna(decl, amostra, col) +
@@ -1062,7 +1145,7 @@ static void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& a
         if (ds.salvar_hora && !ds.chave_hora.empty() && ds.chave_hora != ds.chave_data)
             chave.push_back(ds.chave_hora);
         chave.push_back("latitude");
-        chave.push_back("longitude");
+        chave.push_back("length");
         sql += ",\n  UNIQUE (" + juntar(chave, ", ") + ")\n)";
         executar_sql(conn, sql);
         log("[DB] Table created: " + ds.db + "." + ds.tabela + " (" +
@@ -1070,7 +1153,7 @@ static void garantir_tabela(const DatasetCfg& ds, const std::vector<Registro>& a
     } else {
         for (const auto& col : ordem) {
             if (std::find(existentes.begin(), existentes.end(), col) == existentes.end()) {
-                std::string decl = "auto";
+                std::string decl = "car";
                 auto it = tipo_decl.find(col);
                 if (it != tipo_decl.end()) decl = it->second;
                 executar_sql(conn, "ALTER TABLE \"" + ds.tabela + "\" ADD COLUMN " + col +
@@ -1310,7 +1393,7 @@ static std::vector<Registro> baixar_dataset_bloco(const DatasetCfg& ds,
         }
         std::map<std::string, std::string> params = {
             {"latitude", num_str(lat)},
-            {"longitude", num_str(lon)},
+            {"length", num_str(lon)},
             {"start_date", grupo.front()},
             {"end_date", grupo.back()},
             {"timezone", CFG.fuso_horario},
@@ -1546,7 +1629,7 @@ static void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& re
     pref_add(ds.chave_data);
     if (ds.salvar_hora) pref_add(ds.chave_hora);
     pref_add("latitude");
-    pref_add("longitude");
+    pref_add("length");
     pref_add("timezone");
     for (const auto& c : campos) {
         if (std::find(pref.begin(), pref.end(), c) == pref.end()) pref.push_back(c);
@@ -1559,7 +1642,7 @@ static void salvar_dataset(const DatasetCfg& ds, const std::vector<Registro>& re
     if (ds.salvar_hora && !ds.chave_hora.empty() && ds.chave_hora != ds.chave_data)
         chave.push_back(ds.chave_hora);
     chave.push_back("latitude");
-    chave.push_back("longitude");
+    chave.push_back("length");
 
     std::vector<std::string> marc(campos.size() + 1, "?");
     std::string sql = "INSERT INTO \"" + ds.tabela + "\" (" + juntar(campos, ",") +
@@ -1634,7 +1717,7 @@ static ExistentesGen carregar_existentes_generico(const std::vector<std::string>
             !ds.chave_data.empty() &&
             std::find(cols.begin(), cols.end(), ds.chave_data) != cols.end();
         bool tem_lat = std::find(cols.begin(), cols.end(), "latitude") != cols.end();
-        bool tem_lon = std::find(cols.begin(), cols.end(), "longitude") != cols.end();
+        bool tem_lon = std::find(cols.begin(), cols.end(), "length") != cols.end();
         auto& mapa = out[di];
         for (const auto& c : CFG.coordenadas) mapa[c] = ConjuntoDatas();
         if (!tem_data || !tem_lat || !tem_lon || datas.empty()) continue;
@@ -1876,8 +1959,9 @@ static int executar_generico(const std::vector<std::string>& datas, double tempo
               << "============================================================\n"
               << "Team total: " << tt << "s\n"
               << "Team burden DB: " << tempo_load << "s\n"
-              << "Blocos: " << concluidos.load() << "/" << total << "\n--- ABRIDGEMENT ---\n";
+              << "Blocks: " << concluidos.load() << "/" << total << "\n--- ABRIDGEMENT ---\n";
     for (size_t di = 0; di < CFG.datasets.size(); ++di) {
+        if (CFG.datasets[di].tipo_saida == "arquivo") continue;
         std::cout << CFG.datasets[di].id << " (" << CFG.datasets[di].db << "."
                   << CFG.datasets[di].tabela << "): " << baixados[di]
                   << " dias baixados | " << pulados[di] << " already existentes\n";
@@ -1886,68 +1970,698 @@ static int executar_generico(const std::vector<std::string>& datas, double tempo
     return 0;
 }
 
+// -----------------------------------------------------------------------------
+// DOWNLOAD DE DATASETS EM ARQUIVO (ex: CDS API / ERA5)
+// -----------------------------------------------------------------------------
+struct RespostaHttpAvancada {
+    long status = 0;
+    bool erro_rede = false;
+    std::string erro_mensagem;
+    std::string corpo;
+    std::string header_location;
+};
+
+static size_t escrever_string_cb(char* ptr, size_t tam, size_t nmemb, void* ud) {
+    auto* s = static_cast<std::string*>(ud);
+    s->append(ptr, tam * nmemb);
+    return tam * nmemb;
+}
+
+static size_t ler_headers_cb(char* buffer, size_t tam, size_t n, void* ud) {
+    auto* resp = static_cast<RespostaHttpAvancada*>(ud);
+    std::string linha(buffer, tam * n);
+    std::string baixo = linha;
+    std::transform(baixo.begin(), baixo.end(), baixo.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (baixo.rfind("location:", 0) == 0) {
+        resp->header_location = cortar(linha.substr(9));
+    }
+    return tam * n;
+}
+
+static size_t escrever_arquivo_cb(char* ptr, size_t tam, size_t nmemb, void* ud) {
+    auto* out = static_cast<std::ofstream*>(ud);
+    out->write(ptr, tam * nmemb);
+    return tam * nmemb;
+}
+
+static RespostaHttpAvancada http_post_json(const std::string& url,
+                                           const std::string& json_body,
+                                           const std::string& api_key,
+                                           double timeout_sec = 60.0) {
+    RespostaHttpAvancada r;
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        r.erro_rede = true;
+        r.erro_mensagem = "Falha ao inicializar CURL";
+        return r;
+    }
+
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Accept: application/json");
+    if (!api_key.empty()) {
+        if (api_key.find(':') != std::string::npos) {
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+            curl_easy_setopt(curl, CURLOPT_USERPWD, api_key.c_str());
+        } else {
+            std::string auth_header = "Authorization: Bearer " + api_key;
+            headers = curl_slist_append(headers, auth_header.c_str());
+        }
+        std::string token_header = "PRIVATE-TOKEN: " + api_key;
+        headers = curl_slist_append(headers, token_header.c_str());
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_string_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.corpo);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ler_headers_cb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &r);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_sec * 1000.0));
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc != CURLE_OK) {
+        r.erro_rede = true;
+        r.erro_mensagem = curl_easy_strerror(rc);
+    } else {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
+static RespostaHttpAvancada http_get_headers(const std::string& url,
+                                             const std::string& api_key,
+                                             double timeout_sec = 60.0) {
+    RespostaHttpAvancada r;
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        r.erro_rede = true;
+        r.erro_mensagem = "Falha ao inicializar CURL";
+        return r;
+    }
+
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Accept: application/json");
+    if (!api_key.empty()) {
+        if (api_key.find(':') != std::string::npos) {
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+            curl_easy_setopt(curl, CURLOPT_USERPWD, api_key.c_str());
+        } else {
+            std::string auth_header = "Authorization: Bearer " + api_key;
+            headers = curl_slist_append(headers, auth_header.c_str());
+        }
+        std::string token_header = "PRIVATE-TOKEN: " + api_key;
+        headers = curl_slist_append(headers, token_header.c_str());
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_string_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.corpo);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, ler_headers_cb);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &r);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_sec * 1000.0));
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc != CURLE_OK) {
+        r.erro_rede = true;
+        r.erro_mensagem = curl_easy_strerror(rc);
+    } else {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
+// Algumas respostas do CDS trazem lixo JSON percent-encoded colado a URL real
+// (ex.: ".../arquivo.grib%22,%22file:checksum%22:%22f8d9...%22,...").
+// A URL real termina no primeiro %22 (aspas codificada) ou aspas literal.
+static std::string sanitizar_url_download(std::string url) {
+    const char* brancos = " \t\r\n";
+    size_t inicio = url.find_first_not_of(brancos);
+    if (inicio == std::string::npos) return "";
+    url = url.substr(inicio, url.find_last_not_of(brancos) - inicio + 1);
+
+    size_t corte = url.find("%22");
+    if (corte == std::string::npos) corte = url.find('"');
+    if (corte != std::string::npos) {
+        if (corte == 0) return "";
+        url.resize(corte);
+    }
+    return url;
+}
+
+static std::string extrair_url_download_bruto(const json& j) {
+    if (j.contains("asset") && j["asset"].is_object()) {
+        const auto& a = j["asset"];
+        if (a.contains("value") && a["value"].is_object()) {
+            const auto& v = a["value"];
+            if (v.contains("href") && v["href"].is_string()) {
+                return v["href"].get<std::string>();
+            }
+        }
+        if (a.contains("href") && a["href"].is_string()) {
+            return a["href"].get<std::string>();
+        }
+    }
+    if (j.contains("location") && j["location"].is_string()) {
+        return j["location"].get<std::string>();
+    }
+    if (j.contains("href") && j["href"].is_string()) {
+        return j["href"].get<std::string>();
+    }
+    if (j.contains("url") && j["url"].is_string()) {
+        return j["url"].get<std::string>();
+    }
+    if (j.contains("download_url") && j["download_url"].is_string()) {
+        return j["download_url"].get<std::string>();
+    }
+    if (j.contains("result") && j["result"].is_object()) {
+        return extrair_url_download_bruto(j["result"]);
+    }
+    return "";
+}
+
+static std::string extrair_url_download(const json& j) {
+    return sanitizar_url_download(extrair_url_download_bruto(j));
+}
+
+struct DownloadProgressContext {
+    std::string tag;
+    std::chrono::steady_clock::time_point ult_log;
+};
+
+static int curl_xfer_info_cb(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t) {
+    if (dltotal <= 0) return 0;
+    auto* ctx = static_cast<DownloadProgressContext*>(clientp);
+    auto agora = std::chrono::steady_clock::now();
+    double dec = std::chrono::duration<double>(agora - ctx->ult_log).count();
+    if (dec >= 0.5 || dlnow == dltotal) {
+        ctx->ult_log = agora;
+        double baixado_mb = static_cast<double>(dlnow) / (1024.0 * 1024.0);
+        double total_mb = static_cast<double>(dltotal) / (1024.0 * 1024.0);
+        double pct = (total_mb > 0.0) ? (baixado_mb / total_mb * 100.0) : 0.0;
+
+        char buf[200];
+        std::snprintf(buf, sizeof(buf), "\r  [BAIXANDO] %s: %.2f MB / %.2f MB (%.1f%%)",
+                      ctx->tag.c_str(), baixado_mb, total_mb, pct);
+        std::lock_guard<std::mutex> lk(g_print_mtx);
+        std::cout << buf << std::flush;
+        if (dlnow == dltotal) {
+            std::cout << std::endl;
+        }
+    }
+    return 0;
+}
+
+static bool http_download_stream(const std::string& url,
+                                 const std::string& caminho_destino,
+                                 const std::string& api_key,
+                                 const std::string& tag,
+                                 double timeout_sec = 1800.0) {
+    std::ofstream arq(caminho_destino, std::ios::binary);
+    if (!arq) return false;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+
+    bool eh_storage_presigned = (url.find("object-store") != std::string::npos ||
+                                 url.find("s3.") != std::string::npos ||
+                                 url.find("amazonaws.com") != std::string::npos ||
+                                 url.find("Signature=") != std::string::npos ||
+                                 url.find("X-Amz-") != std::string::npos ||
+                                 url.find("cci2-prod-cache") != std::string::npos);
+
+    struct curl_slist* headers = nullptr;
+    if (!api_key.empty() && !eh_storage_presigned) {
+        if (api_key.find(':') != std::string::npos) {
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+            curl_easy_setopt(curl, CURLOPT_USERPWD, api_key.c_str());
+        } else {
+            std::string auth_header = "Authorization: Bearer " + api_key;
+            headers = curl_slist_append(headers, auth_header.c_str());
+        }
+        std::string token_header = "PRIVATE-TOKEN: " + api_key;
+        headers = curl_slist_append(headers, token_header.c_str());
+    }
+
+    DownloadProgressContext prog_ctx{tag, std::chrono::steady_clock::now()};
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    if (headers) {
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    }
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, escrever_arquivo_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &arq);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_xfer_info_cb);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &prog_ctx);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, static_cast<long>(timeout_sec * 1000.0));
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+    CURLcode rc = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+
+    if (headers) curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    arq.close();
+
+    if (rc != CURLE_OK || status < 200 || status >= 300) {
+        log("\n[ERRO] Download HTTP " + std::to_string(status) + " para " + tag);
+        return false;
+    }
+
+    std::ifstream checagem(caminho_destino, std::ios::binary);
+    if (!checagem) return false;
+
+    char cabecalho[512] = {0};
+    checagem.read(cabecalho, sizeof(cabecalho) - 1);
+    std::streamsize lidos = checagem.gcount();
+    checagem.close();
+
+    std::string inicio_str(cabecalho, lidos > 0 ? static_cast<size_t>(lidos) : 0);
+    if (inicio_str.rfind("<?xml", 0) == 0 || inicio_str.rfind("<html", 0) == 0 ||
+        inicio_str.rfind("<!DOCTYPE", 0) == 0 || inicio_str.rfind("{\"error\"", 0) == 0 ||
+        inicio_str.rfind("{\"code\"", 0) == 0) {
+        // NOTA: "{\"asset\"" NAO e erro — e metadados com o href real dos dados;
+        // o chamador (processar_dataset_era5_mes) segue o href ate o arquivo.
+        log("\n[ERRO] O servidor retornou mensagem de erro para " + tag + ": " + inicio_str.substr(0, 150));
+        return false;
+    }
+
+    return true;
+}
+
+// Se o arquivo baixado for JSON de metadados (endpoint devolve "asset" com o
+// href real dos dados em vez do dado em si), devolve a URL real; caso contrario
+// (dados de verdade, binario GRIB/NetCDF) devolve string vazia.
+static std::string extrair_asset_de_arquivo(const std::filesystem::path& arq) {
+    std::error_code ec;
+    unsigned long long tam = std::filesystem::file_size(arq, ec);
+    // Respostas de metadados sao minusculas; dados reais ultrapassam 1 MB
+    if (ec || tam == 0 || tam > 1024ULL * 1024ULL) return "";
+
+    std::ifstream in(arq, std::ios::binary);
+    if (!in) return "";
+    std::string conteudo;
+    conteudo.resize(static_cast<size_t>(tam));
+    in.read(conteudo.data(), static_cast<std::streamsize>(tam));
+    conteudo.resize(static_cast<size_t>(in.gcount()));
+
+    size_t i = conteudo.find_first_not_of(" \t\r\n");
+    if (i == std::string::npos || conteudo[i] != '{') return "";
+
+    try {
+        json j = json::parse(conteudo);
+        return extrair_url_download(j);
+    } catch (...) {
+        return "";
+    }
+}
+
+static bool processar_dataset_era5_mes(const DatasetCfg& ds, int ano, int mes, const std::string& base_url, const std::string& api_key) {
+    std::string pasta_saida_str = obter_env_ou_config("PASTA_SAIDA", ds.pasta_saida, "dados_era5");
+    std::filesystem::path pasta_saida(pasta_saida_str);
+    std::filesystem::create_directories(pasta_saida);
+
+    std::string extensao = obter_env_ou_config("FORMATO", ds.extensao, "grib");
+    if (extensao == "netcdf") extensao = "nc";
+
+    char nome_final[128];
+    std::snprintf(nome_final, sizeof(nome_final), "era5_%04d_%02d.%s", ano, mes, extensao.c_str());
+    std::filesystem::path destino = pasta_saida / nome_final;
+
+    if (std::filesystem::exists(destino)) {
+        if (std::filesystem::file_size(destino) > 100000) {
+            log("[JÁ EXISTE] " + std::string(nome_final));
+            return true;
+        } else {
+            log("[REMOVENDO ARQUIVO INVÁLIDO/INCOMPLETO] " + std::string(nome_final));
+            std::filesystem::remove(destino);
+        }
+    }
+
+    int dias_no_mes = 31;
+    if (mes == 4 || mes == 6 || mes == 9 || mes == 11) dias_no_mes = 30;
+    else if (mes == 2) {
+        bool bissexto = (ano % 4 == 0 && (ano % 100 != 0 || ano % 400 == 0));
+        dias_no_mes = bissexto ? 29 : 28;
+    }
+
+    int dias_atraso = para_int(obter_env_ou_config("DIAS_ATRASO", "", std::to_string(ds.dias_atraso)), 7);
+    Data data_limite = civil_de_dias(dias_de_civil(agora_local().tm_year + 1900, agora_local().tm_mon + 1, agora_local().tm_mday) - dias_atraso);
+
+    if (ano == data_limite.ano && mes == data_limite.mes) {
+        dias_no_mes = std::min(dias_no_mes, data_limite.dia);
+    }
+
+    std::vector<std::string> lista_dias;
+    for (int d = 1; d <= dias_no_mes; ++d) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "%02d", d);
+        lista_dias.push_back(buf);
+    }
+
+    std::vector<std::string> horarios = ds.horarios;
+    if (horarios.empty()) {
+        std::string h_str = obter_env_ou_config("HORARIOS", "", "00:00,12:00");
+        horarios = dividir(h_str, ',');
+    }
+
+    std::vector<std::string> vars = ds.vars;
+    if (vars.empty()) {
+        vars = {
+            "10m_u_component_of_wind", "10m_v_component_of_wind",
+            "2m_temperature", "2m_dewpoint_temperature",
+            "surface_pressure", "mean_sea_level_pressure",
+            "total_precipitation", "surface_solar_radiation_downwards"
+        };
+    }
+
+    std::string dataset_name = ds.dataset_api.empty() ? "reanalysis-era5-single-levels" : ds.dataset_api;
+
+    char tag[64];
+    std::snprintf(tag, sizeof(tag), "%04d-%02d", ano, mes);
+    log("[SOLICITANDO] " + std::string(tag));
+
+    json solicitacao_direct;
+    solicitacao_direct["product_type"] = json::array({ds.product_type.empty() ? "reanalysis" : ds.product_type});
+    solicitacao_direct["variable"] = vars;
+    char ano_str[16], mes_str[16];
+    std::snprintf(ano_str, sizeof(ano_str), "%04d", ano);
+    std::snprintf(mes_str, sizeof(mes_str), "%02d", mes);
+    solicitacao_direct["year"] = json::array({ano_str});
+    solicitacao_direct["month"] = json::array({mes_str});
+    solicitacao_direct["day"] = lista_dias;
+    solicitacao_direct["time"] = horarios;
+    solicitacao_direct["format"] = (extensao == "nc" ? "netcdf" : "grib");
+    solicitacao_direct["data_format"] = (extensao == "nc" ? "netcdf" : "grib");
+    solicitacao_direct["download_format"] = "unarchived";
+
+    json solicitacao_cads;
+    solicitacao_cads["inputs"] = solicitacao_direct;
+
+    std::string endpoint_post = base_url;
+    if (endpoint_post.rfind("http", 0) != 0) {
+        endpoint_post = "https://cds.climate.copernicus.eu/api";
+    }
+    if (endpoint_post.back() == '/') endpoint_post.pop_back();
+
+    // 1ª Tentativa: CDS API padrão (/resources/{dataset}) — endpoint antigo que
+    // hoje retorna 404. 2ª Tentativa: CADS (/retrieve/v1/processes/{dataset}/execute).
+    // A sequência é repetida em falhas transitorias (429/5xx/erro de rede).
+    std::string url_execute = endpoint_post + "/resources/" + dataset_name;
+    RespostaHttpAvancada resp;
+    for (int tentativa = 0; tentativa < 3; ++tentativa) {
+        if (tentativa > 0) {
+            long espera = (resp.status == 429) ? 30L : 10L * tentativa;
+            log("[REPETINDO] " + std::string(tag) + ": nova tentativa de envio em " +
+                std::to_string(espera) + "s (falha anterior: HTTP " + std::to_string(resp.status) +
+                (resp.erro_rede ? " / " + resp.erro_mensagem : "") + ")");
+            dormir(static_cast<double>(espera));
+        }
+
+        url_execute = endpoint_post + "/resources/" + dataset_name;
+        resp = http_post_json(url_execute, solicitacao_direct.dump(), api_key);
+
+        if (resp.status >= 400 || resp.erro_rede) {
+            std::string url_cads = endpoint_post + "/retrieve/v1/processes/" + dataset_name + "/execute";
+            RespostaHttpAvancada resp_cads = http_post_json(url_cads, solicitacao_cads.dump(), api_key);
+            if (!resp_cads.erro_rede && resp_cads.status < 400) {
+                url_execute = url_cads;
+            }
+            // O CADS é a autoridade quando o /resources falha: mantém a resposta
+            // real dele (429/5xx) para diagnóstico e para decidir a repetição.
+            resp = std::move(resp_cads);
+        }
+
+        if (!resp.erro_rede && resp.status < 400) break;
+    }
+
+    if (resp.erro_rede || resp.status >= 400) {
+        log("[ERRO] Falha ao enviar solicitação para " + std::string(tag) + ": HTTP " + std::to_string(resp.status) + " " + resp.erro_mensagem + " " + resp.corpo.substr(0, 200));
+        return false;
+    }
+
+    std::string job_id;
+    std::string download_url;
+
+    try {
+        json jresp = json::parse(resp.corpo);
+        download_url = extrair_url_download(jresp);
+        if (download_url.empty()) {
+            if (jresp.contains("job_id") && jresp["job_id"].is_string()) {
+                job_id = jresp["job_id"].get<std::string>();
+            } else if (jresp.contains("jobID") && jresp["jobID"].is_string()) {
+                job_id = jresp["jobID"].get<std::string>();
+            }
+        }
+    } catch (...) {}
+
+    if (job_id.empty() && download_url.empty() && !resp.header_location.empty()) {
+        download_url = sanitizar_url_download(resp.header_location);
+    }
+
+    if (!job_id.empty() && download_url.empty()) {
+        std::string status_url = endpoint_post + "/retrieve/v1/jobs/" + job_id;
+        for (int tentativa = 0; tentativa < 300; ++tentativa) {
+            dormir(3.0);
+            RespostaHttpAvancada sresp = http_get_headers(status_url, api_key);
+            if (sresp.erro_rede || sresp.status >= 400) continue;
+
+            try {
+                json sj = json::parse(sresp.corpo);
+                std::string st = sj.value("status", "");
+                if (st == "successful" || st == "completed") {
+                    download_url = extrair_url_download(sj);
+                    if (download_url.empty()) download_url = status_url + "/results";
+                    break;
+                } else if (st == "failed") {
+                    log("[ERRO] Job falhou no servidor para " + std::string(tag));
+                    return false;
+                }
+            } catch (...) {}
+        }
+    }
+
+    download_url = sanitizar_url_download(download_url);
+
+    if (download_url.empty()) {
+        log("[ERRO] Não foi possível obter URL de download para " + std::string(tag));
+        return false;
+    }
+
+    if (download_url.rfind("http", 0) != 0) {
+        if (download_url.front() != '/') download_url = "/" + download_url;
+        download_url = endpoint_post + download_url;
+    }
+
+    // Salva com extensão temporária .temp durante o download
+    char nome_temp[128];
+    std::snprintf(nome_temp, sizeof(nome_temp), "era5_%04d_%02d.temp", ano, mes);
+    std::filesystem::path temporario = pasta_saida / nome_temp;
+
+    if (std::filesystem::exists(temporario)) {
+        std::filesystem::remove(temporario);
+    }
+
+    // O endpoint pode devolver JSON de metadados ("asset" com href + file:size)
+    // em vez dos dados; nesse caso segue o href ate chegar ao arquivo real.
+    std::string url_atual = download_url;
+    bool ok = false;
+    for (int via = 0; via < 4; ++via) {
+        log("[URL] " + std::string(tag) + ": " + url_atual);
+        ok = http_download_stream(url_atual, temporario.string(), api_key, tag);
+        if (!ok) break;
+
+        std::string asset_url = extrair_asset_de_arquivo(temporario);
+        if (asset_url.empty() || asset_url == url_atual) break;  // baixou os dados
+
+        log("[SEGUNDO-ESTAGIO] " + std::string(tag) + ": obtendo dados de " + asset_url);
+        url_atual = asset_url;
+    }
+
+    if (!ok || !std::filesystem::exists(temporario) || std::filesystem::file_size(temporario) < 100000) {
+        log("[ERRO] Arquivo baixado incompleto ou corrompido para " + std::string(tag));
+        if (std::filesystem::exists(temporario)) std::filesystem::remove(temporario);
+        return false;
+    }
+
+    std::filesystem::rename(temporario, destino);
+    log("[CONCLUÍDO] " + destino.string());
+    return true;
+}
+
+static void executar_dataset_arquivo(const DatasetCfg& ds) {
+    std::string pasta_saida_str = obter_env_ou_config("PASTA_SAIDA", ds.pasta_saida, "dados_era5");
+    std::filesystem::path pasta_saida(pasta_saida_str);
+
+    // Limpeza inicial: remove todos os arquivos .temp e .part ao iniciar
+    if (std::filesystem::exists(pasta_saida)) {
+        for (const auto& entry : std::filesystem::directory_iterator(pasta_saida)) {
+            if (entry.is_regular_file()) {
+                std::string ext = entry.path().extension().string();
+                if (ext == ".temp" || ext == ".part") {
+                    try {
+                        std::filesystem::remove(entry.path());
+                        log("[LIMPEZA] Removido arquivo temporário: " + entry.path().filename().string());
+                    } catch (...) {}
+                }
+            }
+        }
+    }
+
+    std::string api_url = ds.url.empty() ? obter_env_ou_config("CDSAPI_URL", "", "https://cds.climate.copernicus.eu/api") : ds.url;
+    std::string api_key = ds.api_keys.empty() ? obter_env_ou_config("CDSAPI_KEY", "") : ds.api_keys;
+
+    int ano_inicial = para_int(obter_env_ou_config("ANO_INICIAL", "", std::to_string(ds.ano_inicial)), 1940);
+    int dias_atraso = para_int(obter_env_ou_config("DIAS_ATRASO", "", std::to_string(ds.dias_atraso)), 7);
+
+    Data data_limite = civil_de_dias(dias_de_civil(agora_local().tm_year + 1900, agora_local().tm_mon + 1, agora_local().tm_mday) - dias_atraso);
+
+    log("============================================================");
+    log("PROCESSANDO DATASET EM ARQUIVOS: " + ds.id);
+    log("Diretório de saída: " + pasta_saida.string());
+    log("Anos: " + std::to_string(ano_inicial) + " até " + std::to_string(data_limite.ano));
+    log("============================================================");
+
+    for (int ano = ano_inicial; ano <= data_limite.ano; ++ano) {
+        for (int mes = 1; mes <= 12; ++mes) {
+            if (ano == data_limite.ano && mes > data_limite.mes) break;
+            processar_dataset_era5_mes(ds, ano, mes, api_url, api_key);
+        }
+    }
+}
+
 int main(int argc, char** argv) {
-    std::string caminho_ini = argc > 1 ? argv[1] : "download.ini";
+    std::string caminho_ini = "download.ini";
+    std::vector<std::string> filtros_secao;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        std::string arg_lower = arg;
+        std::transform(arg_lower.begin(), arg_lower.end(), arg_lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+
+        if (arg.size() >= 4 && arg_lower.rfind(".ini") == arg.size() - 4) {
+            caminho_ini = arg;
+        } else if (arg == "-d" || arg == "--dataset" || arg == "-s" || arg == "--secao") {
+            if (i + 1 < argc) {
+                filtros_secao.push_back(argv[++i]);
+            }
+        } else {
+            if (arg.front() == '-') continue;
+            if (i == 1 && std::filesystem::exists(arg)) {
+                caminho_ini = arg;
+            } else {
+                auto partes = dividir(arg, ',');
+                for (const auto& p : partes) {
+                    if (!p.empty()) filtros_secao.push_back(p);
+                }
+            }
+        }
+    }
+
+    carregar_env(".env");
     carregar_config(caminho_ini);
+
+    if (!filtros_secao.empty()) {
+        std::vector<DatasetCfg> datasets_filtrados;
+        for (const auto& ds : CFG.datasets) {
+            bool aceito = false;
+            std::string id_low = ds.id;
+            std::transform(id_low.begin(), id_low.end(), id_low.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            for (const auto& f : filtros_secao) {
+                std::string flow = f;
+                std::transform(flow.begin(), flow.end(), flow.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                if (flow.rfind("dataset:", 0) == 0) flow = flow.substr(8);
+                if (id_low == flow || ds.id == f) {
+                    aceito = true;
+                    break;
+                }
+            }
+            if (aceito) {
+                datasets_filtrados.push_back(ds);
+            }
+        }
+        CFG.datasets = std::move(datasets_filtrados);
+    }
+
     if (CFG.datasets.empty()) {
-        std::cerr << "[ERROR] None [dataset:*] definido in " << caminho_ini
-                  << ". THE formato old (daily_params/hourly_params/...) not and more "
-                     "suportado; declare at less a section [dataset:<id>].\n";
+        std::cerr << "[ERROR] Nenhum dataset correspondente encontrado em " << caminho_ini << "\n";
         return 1;
     }
+
     curl_global_init(CURL_GLOBAL_DEFAULT);
     iniciar_rate_limit();
 
     try {
-        std::vector<std::string> datas = expandir_periodo(CFG.periodo_inicio, CFG.periodo_fim);
-        if (datas.empty()) {
-            std::cerr << "[ERROR] Period disabled (start > end) in " << caminho_ini << "\n";
-            curl_global_cleanup();
-            return 1;
-        }
-
-        std::cout << "============================================================\n"
-                  << "DOWNLOAD OF DATA CLIMATICOS (generico)\n"
-                  << "============================================================\n"
-                  << "Configuracao: " << caminho_ini << "\n"
-                  << "Spindle schedule: " << CFG.fuso_horario << "\n"
-                  << "Database of date: " << CFG.db_path << "\n";
-        {
-            std::set<std::string> dbs;
-            for (const auto& ds : CFG.datasets) dbs.insert(ds.db);
-            std::cout << "Bancos target (" << dbs.size() << "): ";
-            bool p = false;
-            for (const auto& d : dbs) {
-                if (p) std::cout << ", ";
-                std::cout << d;
-                p = true;
+        std::vector<DatasetCfg> datasets_db;
+        std::vector<DatasetCfg> datasets_arquivo;
+        for (const auto& ds : CFG.datasets) {
+            if (ds.tipo_saida == "arquivo") {
+                datasets_arquivo.push_back(ds);
+            } else {
+                datasets_db.push_back(ds);
             }
-            std::cout << "\nDatasets (" << CFG.datasets.size() << "): ";
-            p = false;
-            for (const auto& ds : CFG.datasets) {
-                if (p) std::cout << ", ";
-                std::cout << ds.id << "->" << ds.db << "." << ds.tabela;
-                p = true;
+        }
+
+        // 1) Executa datasets em arquivo (ex: ERA5 -> dados_era5/)
+        for (const auto& ds : datasets_arquivo) {
+            executar_dataset_arquivo(ds);
+        }
+
+        // 2) Executa datasets em banco SQLite (ex: Open-Meteo -> clima.db)
+        if (!datasets_db.empty()) {
+            std::vector<std::string> datas = expandir_periodo(CFG.periodo_inicio, CFG.periodo_fim);
+            if (!datas.empty()) {
+                std::cout << "============================================================\n"
+                          << "DOWNLOAD DE DADOS CLIMATICOS (BANCO SQLITE)\n"
+                          << "============================================================\n"
+                          << "Configuracao: " << caminho_ini << "\n"
+                          << "Fuso horario: " << CFG.fuso_horario << "\n"
+                          << "Banco de dados: " << CFG.db_path << "\n";
+
+                criar_tabelas_datasets();
+
+                std::cout << "\n[DB] Carregando registros existentes...\n";
+                auto t0 = std::chrono::steady_clock::now();
+                ExistentesGen existentes = carregar_existentes_generico(datas);
+                double tload = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                for (size_t di = 0; di < CFG.datasets.size(); ++di) {
+                    if (CFG.datasets[di].tipo_saida == "arquivo") continue;
+                    long long tot = 0;
+                    auto it = existentes.find(di);
+                    if (it != existentes.end())
+                        for (const auto& kv : it->second) tot += (long long)kv.second.size();
+                    std::cout << "[DB] " << CFG.datasets[di].id << ": " << tot << " dias\n";
+                }
+                executar_generico(datas, tload, existentes);
             }
-            std::cout << "\n";
         }
 
-        criar_tabelas_datasets();
-
-        std::cout << "\n[DB] Loading registros existentes...\n";
-        auto t0 = std::chrono::steady_clock::now();
-        ExistentesGen existentes = carregar_existentes_generico(datas);
-        double tload = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        for (size_t di = 0; di < CFG.datasets.size(); ++di) {
-            long long tot = 0;
-            auto it = existentes.find(di);
-            if (it != existentes.end())
-                for (const auto& kv : it->second) tot += (long long)kv.second.size();
-            std::cout << "[DB] " << CFG.datasets[di].id << ": " << tot << " dias\n";
-        }
-        int rc = executar_generico(datas, tload, existentes);
         curl_global_cleanup();
-        return rc;
+        return 0;
     } catch (const std::exception& e) {
         std::cerr << "\n[ERRO] " << e.what() << "\n";
         curl_global_cleanup();

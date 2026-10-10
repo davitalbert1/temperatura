@@ -52,7 +52,7 @@ Downloader (precisa de `download.ini` na raiz do projeto):
 Test (precisa de `download.ini` na raiz do projeto):
 
 ```sh
-./build/test.exe ./download.ini
+./build/clima_auditor.exe
 ```
 
 No PowerShell/VS Code (raiz do projeto):
